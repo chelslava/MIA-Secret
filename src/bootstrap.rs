@@ -1,6 +1,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
+use zeroize::Zeroize;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -76,6 +79,7 @@ fn ensure_random_file(path: &Path, len: usize) -> Result<(), AppError> {
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(&bytes)?;
     file.flush()?;
+    bytes.zeroize();
 
     Ok(())
 }
@@ -92,13 +96,39 @@ fn secure_master_key_permissions(path: &Path) -> Result<(), AppError> {
 
     #[cfg(windows)]
     {
-        let _ = path;
-        tracing::warn!(
-            "master.key ACL hardening is best-effort on Windows in this build; prefer user-private data directory"
-        );
+        let username = std::env::var("USERNAME").map_err(|err| {
+            AppError::Server(format!("unable to detect current Windows user: {err}"))
+        })?;
+        for args in [
+            vec!["/inheritance:r".to_owned()],
+            vec!["/grant:r".to_owned(), format!("{username}:(R,W)")],
+            vec!["/remove:g".to_owned(), "Users".to_owned()],
+            vec!["/remove:g".to_owned(), "Authenticated Users".to_owned()],
+        ] {
+            if let Err(err) = run_icacls(path, &args) {
+                tracing::warn!("master.key ACL hardening failed: {}", err);
+            }
+        }
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn run_icacls(path: &Path, args: &[String]) -> Result<(), AppError> {
+    let output = Command::new("icacls").arg(path).args(args).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(AppError::Server(format!(
+        "failed to harden ACL for {}: stdout='{}' stderr='{}'",
+        path.display(),
+        stdout.trim(),
+        stderr.trim()
+    )))
 }
 
 fn fill_random_bytes(buffer: &mut [u8]) -> Result<(), AppError> {

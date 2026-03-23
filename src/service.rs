@@ -6,6 +6,7 @@ use base64::Engine;
 use rand::TryRngCore;
 use serde_json::Value;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::crypto::CryptoService;
 use crate::domain::{
@@ -337,7 +338,9 @@ fn generate_plain_token() -> Result<String, AppError> {
     rand::rngs::OsRng
         .try_fill_bytes(&mut buf)
         .map_err(|e| AppError::Crypto(format!("token generation failed: {e}")))?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    buf.zeroize();
+    Ok(token)
 }
 
 fn maybe_encrypt_text(

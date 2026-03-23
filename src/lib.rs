@@ -5,5 +5,6 @@ pub mod config;
 pub mod crypto;
 pub mod domain;
 pub mod error;
+pub mod security;
 pub mod service;
 pub mod storage;

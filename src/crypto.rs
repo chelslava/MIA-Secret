@@ -40,8 +40,10 @@ impl Drop for CryptoService {
 impl CryptoService {
     pub fn from_config(cfg: &Config) -> Result<Self, AppError> {
         let master_key_path = Path::new(&cfg.general.data_dir).join(MASTER_KEY_FILE_NAME);
-        let master_key = fs::read(master_key_path)?;
-        Self::from_master_key(&master_key, &cfg.crypto)
+        let mut master_key = fs::read(master_key_path)?;
+        let service = Self::from_master_key(&master_key, &cfg.crypto);
+        master_key.zeroize();
+        service
     }
 
     pub fn from_master_key(master_key: &[u8], cfg: &CryptoConfig) -> Result<Self, AppError> {
@@ -90,36 +92,47 @@ impl CryptoService {
             .try_fill_bytes(&mut nonce_bytes)
             .map_err(|e| AppError::Crypto(format!("nonce generation failed: {e}")))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_bytes())
+        let mut plaintext_bytes = plaintext.as_bytes().to_vec();
+        let mut ciphertext = cipher
+            .encrypt(nonce, plaintext_bytes.as_slice())
             .map_err(|_| AppError::Crypto("encryption failed".to_owned()))?;
+        plaintext_bytes.zeroize();
 
         let mut combined = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         combined.extend_from_slice(&nonce_bytes);
         combined.extend_from_slice(&ciphertext);
-        Ok(format!(
+        ciphertext.zeroize();
+        let encoded = format!(
             "{CIPHERTEXT_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(combined)
-        ))
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&combined)
+        );
+        combined.zeroize();
+        Ok(encoded)
     }
 
     pub fn decrypt_string(&self, value: &str) -> Result<String, AppError> {
         let encoded = value
             .strip_prefix(CIPHERTEXT_PREFIX)
             .ok_or_else(|| AppError::Crypto("unsupported ciphertext format".to_owned()))?;
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        let mut decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
             .map_err(|e| AppError::Crypto(format!("ciphertext decode failed: {e}")))?;
         if decoded.len() <= NONCE_LEN {
+            decoded.zeroize();
             return Err(AppError::Crypto("ciphertext payload too short".to_owned()));
         }
         let (nonce_bytes, ciphertext) = decoded.split_at(NONCE_LEN);
         let cipher = Aes256Gcm::new_from_slice(&self.encryption_key)
             .map_err(|e| AppError::Crypto(format!("invalid key: {e}")))?;
-        let plain = cipher
+        let mut plain = cipher
             .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
             .map_err(|_| AppError::Crypto("decryption failed".to_owned()))?;
-        String::from_utf8(plain).map_err(|e| AppError::Crypto(format!("utf8 decode failed: {e}")))
+        let result = std::str::from_utf8(&plain)
+            .map(|s| s.to_owned())
+            .map_err(|e| AppError::Crypto(format!("utf8 decode failed: {e}")));
+        plain.zeroize();
+        decoded.zeroize();
+        result
     }
 
     pub fn decrypt_auto(&self, value: &str) -> Result<String, AppError> {

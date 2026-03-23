@@ -5,6 +5,7 @@ mod config;
 mod crypto;
 mod domain;
 mod error;
+mod security;
 mod service;
 mod storage;
 
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use cli::{Cli, Commands, ConfigCommands, TokenCommands};
 use error::AppError;
+use security::redact_json;
 use serde::Serialize;
 use storage::SqliteStorage;
 
@@ -289,7 +291,8 @@ async fn request_json<T: Serialize>(
     let parsed: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
     if !status.is_success() {
-        return Err(AppError::Server(format!("api error {status}: {parsed}")));
+        let safe = redact_json(&parsed);
+        return Err(AppError::Server(format!("api error {status}: {safe}")));
     }
     Ok(parsed)
 }

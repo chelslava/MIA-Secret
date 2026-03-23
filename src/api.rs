@@ -2,6 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -147,6 +148,7 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
         .route("/api/v1/health", get(health))
         .merge(protected_routes)
         .with_state(state.clone())
+        .layer(middleware::from_fn(access_log_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             timeout_middleware,
@@ -359,6 +361,25 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
     if let Ok(value) = HeaderValue::from_str(&trace_id) {
         response.headers_mut().insert("x-trace-id", value);
     }
+    response
+}
+
+async fn access_log_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let trace_id = extract_trace_id_from_request(&req).unwrap_or_else(|| "n/a".to_owned());
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    let elapsed_ms = start.elapsed().as_millis();
+    tracing::info!(
+        trace_id = %trace_id,
+        method = %method,
+        path = %path,
+        status = status,
+        elapsed_ms = elapsed_ms,
+        "request handled"
+    );
     response
 }
 
