@@ -335,3 +335,14 @@ fn storage_backup_rotation_keeps_configured_limit() {
         "expected no more than 2 backups, got {backup_files}"
     );
 }
+
+#[test]
+fn config_rejects_non_loopback_bind_host() {
+    let mut cfg = Config::default();
+    cfg.server.host = "0.0.0.0".to_owned();
+    let result = cfg.validate();
+    assert!(
+        matches!(result, Err(AppError::Validation(ref message)) if message.contains("loopback")),
+        "expected loopback validation error, got {result:?}"
+    );
+}

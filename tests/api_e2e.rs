@@ -242,3 +242,67 @@ async fn api_revoked_token_is_rejected() {
 
     stop_server(shutdown_tx, handle).await;
 }
+
+#[tokio::test]
+async fn api_expired_token_is_rejected() {
+    let root = TestDir::new("expired");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs() as i64;
+
+    let admin_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "admin-exp",
+            "scopes": ["tokens.manage", "secrets.list"],
+            "expires_at": now + 3600
+        }))
+        .send()
+        .await
+        .expect("admin token create");
+    assert!(admin_resp.status().is_success());
+    let admin_json: serde_json::Value = admin_resp.json().await.expect("admin json");
+    let admin_token = admin_json["token"]
+        .as_str()
+        .expect("admin token")
+        .to_owned();
+
+    let expiring_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "name": "expiring",
+            "scopes": ["secrets.list"],
+            "expires_at": now + 1
+        }))
+        .send()
+        .await
+        .expect("expiring token create");
+    assert!(expiring_resp.status().is_success());
+    let expiring_json: serde_json::Value = expiring_resp.json().await.expect("expiring json");
+    let expiring_token = expiring_json["token"]
+        .as_str()
+        .expect("expiring token")
+        .to_owned();
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let expired_access = client
+        .get(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&expiring_token)
+        .send()
+        .await
+        .expect("expired token request");
+    assert_eq!(expired_access.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let expired_body: serde_json::Value = expired_access.json().await.expect("expired body");
+    assert_eq!(expired_body["error"]["code"], "unauthorized");
+
+    stop_server(shutdown_tx, handle).await;
+}

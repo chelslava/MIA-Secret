@@ -48,7 +48,7 @@
 
 ### 4. Тесты и качество (средний приоритет)
 1. [x] Добавить e2e-тесты API поверх HTTP (не только service/storage).
-2. [~] Добавить негативные security-тесты: истекший/отозванный токен, missing scope, loopback-only bind (частично закрыто: revoked/missing scope).
+2. [x] Добавить негативные security-тесты: истекший/отозванный токен, missing scope, loopback-only bind.
 3. [x] Включить в CI `clippy -D warnings`, `fmt --check`, `test`.
 
 ### 5. Поставка (средний приоритет)
