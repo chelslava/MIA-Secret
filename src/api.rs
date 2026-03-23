@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use axum::{Extension, Json, Router};
 use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -29,6 +31,7 @@ use crate::storage::SqliteStorage;
 struct ApiState {
     cfg: Config,
     service: Arc<AppService>,
+    protected_request_timestamps: Arc<Mutex<VecDeque<Instant>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +83,7 @@ struct SafeServerConfig {
     port: u16,
     request_timeout_secs: u64,
     max_request_body_kb: u64,
+    protected_rate_limit_rps: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +147,7 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
     let state = ApiState {
         cfg: cfg.clone(),
         service,
+        protected_request_timestamps: Arc::new(Mutex::new(VecDeque::new())),
     };
 
     let protected_routes = Router::new()
@@ -277,6 +282,7 @@ async fn read_config(
             port: cfg.server.port,
             request_timeout_secs: cfg.server.request_timeout_secs,
             max_request_body_kb: cfg.server.max_request_body_kb,
+            protected_rate_limit_rps: cfg.server.protected_rate_limit_rps,
         },
         security: SafeSecurityConfig {
             token_header: cfg.security.token_header.clone(),
@@ -492,6 +498,17 @@ async fn authz_middleware(
     next: Next,
 ) -> Result<Response, ApiHttpError> {
     let trace_id = extract_trace_id_from_request(&req);
+    if !allow_protected_request(&state).await {
+        return Err(ApiHttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            message: format!(
+                "rate limit exceeded: {} requests per second",
+                state.cfg.server.protected_rate_limit_rps
+            ),
+            trace_id,
+        });
+    }
     if let Some(scope) = required_scope_for_request(&state, req.method(), req.uri().path())
         .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?
     {
@@ -503,6 +520,25 @@ async fn authz_middleware(
             .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?;
     }
     Ok(next.run(req).await)
+}
+
+async fn allow_protected_request(state: &ApiState) -> bool {
+    let now = Instant::now();
+    let mut timestamps = state.protected_request_timestamps.lock().await;
+    while let Some(first) = timestamps.front().copied() {
+        if now.duration_since(first) >= Duration::from_secs(1) {
+            let _ = timestamps.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if timestamps.len() as u64 >= state.cfg.server.protected_rate_limit_rps {
+        return false;
+    }
+
+    timestamps.push_back(now);
+    true
 }
 
 fn required_scope_for_request(
@@ -739,7 +775,11 @@ mod tests {
         let storage = Arc::new(SqliteStorage::from_config(&cfg).expect("storage"));
         let crypto = CryptoService::from_config(&cfg).expect("crypto");
         let service = Arc::new(AppService::new(storage, crypto));
-        ApiState { cfg, service }
+        ApiState {
+            cfg,
+            service,
+            protected_request_timestamps: Arc::new(Mutex::new(VecDeque::new())),
+        }
     }
 
     #[test]
@@ -894,6 +934,21 @@ mod tests {
         let mut cfg = Config::default();
         cfg.server.max_request_body_kb = 1;
         assert_eq!(max_request_body_bytes(&cfg), 1024);
+    }
+
+    #[tokio::test]
+    async fn allow_protected_request_respects_rps_limit() {
+        let state = make_state();
+        let mut cfg = state.cfg.clone();
+        cfg.server.protected_rate_limit_rps = 1;
+        let state = ApiState {
+            cfg,
+            service: state.service.clone(),
+            protected_request_timestamps: Arc::new(Mutex::new(VecDeque::new())),
+        };
+
+        assert!(allow_protected_request(&state).await);
+        assert!(!allow_protected_request(&state).await);
     }
 
     #[test]

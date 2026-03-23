@@ -15,6 +15,7 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 3765;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_REQUEST_BODY_KB: u64 = 64;
+const DEFAULT_PROTECTED_RATE_LIMIT_RPS: u64 = 30;
 const DEFAULT_TOKEN_HEADER: &str = "Authorization";
 const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -56,6 +57,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub request_timeout_secs: u64,
     pub max_request_body_kb: u64,
+    pub protected_rate_limit_rps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +118,7 @@ impl Default for ServerConfig {
             port: DEFAULT_PORT,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             max_request_body_kb: DEFAULT_MAX_REQUEST_BODY_KB,
+            protected_rate_limit_rps: DEFAULT_PROTECTED_RATE_LIMIT_RPS,
         }
     }
 }
@@ -174,6 +177,11 @@ impl Config {
         if self.server.max_request_body_kb == 0 {
             return Err(AppError::Validation(
                 "server.max_request_body_kb must be greater than 0".to_owned(),
+            ));
+        }
+        if self.server.protected_rate_limit_rps == 0 {
+            return Err(AppError::Validation(
+                "server.protected_rate_limit_rps must be greater than 0".to_owned(),
             ));
         }
 
@@ -347,6 +355,10 @@ mod tests {
 
         cfg = Config::default();
         cfg.server.max_request_body_kb = 0;
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.server.protected_rate_limit_rps = 0;
         assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
 
         cfg = Config::default();

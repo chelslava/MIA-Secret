@@ -526,3 +526,47 @@ async fn api_rejects_payload_larger_than_configured_limit() {
 
     stop_server(shutdown_tx, handle).await;
 }
+
+#[tokio::test]
+async fn api_applies_rate_limit_to_protected_routes() {
+    let root = TestDir::new("rate-limit");
+    let mut cfg = test_config(root.path());
+    cfg.server.protected_rate_limit_rps = 1;
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "rate-limit-admin",
+            "scopes": ["secrets.list"]
+        }))
+        .send()
+        .await
+        .expect("create token");
+    assert!(token_resp.status().is_success());
+    let token_json: serde_json::Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let first = client
+        .get(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("first rate-limited request");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    let second = client
+        .get(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("second rate-limited request");
+    assert_eq!(second.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    stop_server(shutdown_tx, handle).await;
+}

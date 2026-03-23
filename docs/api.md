@@ -31,6 +31,7 @@ Authorization: Bearer <token>
 * `conflict`
 * `unauthorized`
 * `forbidden`
+* `rate_limited`
 * `crypto_error`
 * `config_error`
 * `storage_error`
@@ -280,7 +281,8 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
     "host": "127.0.0.1",
     "port": 3765,
     "request_timeout_secs": 30,
-    "max_request_body_kb": 64
+    "max_request_body_kb": 64,
+    "protected_rate_limit_rps": 30
   }
 }
 ```
@@ -313,3 +315,4 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
 * `authz`: централизованная проверка Bearer-токена и требуемого scope по маршруту.
 * `timeout`: ограничение времени обработки запроса согласно `server.request_timeout_secs`.
 * `body-limit`: ограничение размера request body согласно `server.max_request_body_kb` (ответ `413 Payload Too Large` при превышении).
+* `rate-limit`: ограничение скорости для защищенных endpoint-ов согласно `server.protected_rate_limit_rps` (ответ `429 Too Many Requests` при превышении).
