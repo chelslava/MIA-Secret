@@ -15,7 +15,7 @@ use clap::Parser;
 use cli::{Cli, Commands, ConfigCommands, TokenCommands};
 use error::AppError;
 use security::redact_json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use storage::SqliteStorage;
 
 #[tokio::main]
@@ -291,8 +291,71 @@ async fn request_json<T: Serialize>(
     let parsed: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
     if !status.is_success() {
-        let safe = redact_json(&parsed);
-        return Err(AppError::Server(format!("api error {status}: {safe}")));
+        return Err(map_api_error(status, &parsed));
     }
     Ok(parsed)
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorBody {
+    code: String,
+    message: String,
+}
+
+fn map_api_error(status: reqwest::StatusCode, parsed: &serde_json::Value) -> AppError {
+    if let Ok(envelope) = serde_json::from_value::<ApiErrorEnvelope>(parsed.clone()) {
+        return match envelope.error.code.as_str() {
+            "validation_error" => AppError::Validation(envelope.error.message),
+            "not_found" => AppError::NotFound(envelope.error.message),
+            "conflict" => AppError::Conflict(envelope.error.message),
+            "unauthorized" => AppError::Unauthorized(envelope.error.message),
+            "forbidden" => AppError::Forbidden(envelope.error.message),
+            "crypto_error" => AppError::Crypto(envelope.error.message),
+            "config_error" => AppError::Config(envelope.error.message),
+            "storage_error" => AppError::Storage(envelope.error.message),
+            _ => AppError::Server(envelope.error.message),
+        };
+    }
+
+    let safe = redact_json(parsed);
+    AppError::Server(format!("api error {status}: {safe}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_api_error;
+    use crate::error::AppError;
+    use serde_json::json;
+
+    #[test]
+    fn maps_structured_api_error_to_typed_app_error() {
+        let input = json!({
+            "error": {
+                "code": "forbidden",
+                "message": "missing required scope: secrets.write",
+                "traceId": "abc"
+            }
+        });
+        let err = map_api_error(reqwest::StatusCode::FORBIDDEN, &input);
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn redacts_unstructured_api_error_payload() {
+        let input = json!({
+            "raw": {
+                "password": "secret",
+                "note": "visible"
+            }
+        });
+        let err = map_api_error(reqwest::StatusCode::BAD_REQUEST, &input);
+        let text = err.to_string();
+        assert!(!text.contains("secret"));
+        assert!(text.contains("***REDACTED***"));
+    }
 }
