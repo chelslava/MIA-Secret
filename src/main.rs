@@ -17,11 +17,12 @@ use clap::Parser;
 use cli::{
     Cli, Commands, ConfigCommands, DuplicateStrategy, ImportCommands, ImportSource, TokenCommands,
 };
-use domain::{CreateSecretRequest, UpdateSecretRequest};
 use error::AppError;
 use security::redact_json;
 use serde::{Deserialize, Serialize};
-use service::AppService;
+use service::{
+    AppService, ImportDuplicateStrategy, ImportOutcome, ImportSecretRequest as ServiceImportSecret,
+};
 use storage::SqliteStorage;
 
 #[tokio::main]
@@ -256,7 +257,7 @@ struct ImportSecretRow {
     password: String,
     url: Option<String>,
     notes: Option<String>,
-    tags: Vec<String>,
+    tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -290,38 +291,34 @@ fn import_csv(
     let cfg = load_command_config(config_path, None)?;
     bootstrap::ensure_layout(&cfg)?;
     let service = build_local_service(&cfg)?;
-    let rows = parse_import_csv(file, source)?;
-    if rows.is_empty() {
-        return Err(AppError::Validation(format!(
-            "import file {} does not contain any valid rows",
-            file.display()
-        )));
-    }
-
-    let mut summary = ImportSummary::default();
-    for (index, row) in rows.into_iter().enumerate() {
-        match upsert_import_row(&service, row, on_duplicate.clone()) {
-            Ok(ImportResult::Imported) => summary.imported += 1,
-            Ok(ImportResult::Updated) => summary.updated += 1,
-            Ok(ImportResult::Skipped) => summary.skipped += 1,
-            Err(err) => {
-                summary.failed += 1;
-                eprintln!("import row {} failed: {err}", index + 1);
+    let strategy = map_duplicate_strategy(on_duplicate);
+    let source_for_parse = source;
+    let summary = service.run_import_tx(|tx| {
+        let mut summary = ImportSummary::default();
+        let valid_rows = stream_import_csv(file, source_for_parse, |line, row| {
+            let outcome = service
+                .import_secret_tx(tx, to_service_import_row(row), strategy)
+                .map_err(|err| AppError::Validation(format!("import row {line} failed: {err}")))?;
+            match outcome {
+                ImportOutcome::Imported => summary.imported += 1,
+                ImportOutcome::Updated => summary.updated += 1,
+                ImportOutcome::Skipped => summary.skipped += 1,
             }
+            Ok(())
+        })?;
+        if valid_rows == 0 {
+            return Err(AppError::Validation(format!(
+                "import file {} does not contain any valid rows",
+                file.display()
+            )));
         }
-    }
+        Ok(summary)
+    })?;
 
     println!(
         "Import summary: imported={} updated={} skipped={} failed={}",
         summary.imported, summary.updated, summary.skipped, summary.failed
     );
-
-    if summary.failed > 0 {
-        return Err(AppError::Server(format!(
-            "import finished with {} failed row(s)",
-            summary.failed
-        )));
-    }
     Ok(())
 }
 
@@ -331,57 +328,24 @@ fn build_local_service(cfg: &config::Config) -> Result<AppService, AppError> {
     Ok(AppService::new(storage, crypto))
 }
 
-#[derive(Debug)]
-enum ImportResult {
-    Imported,
-    Updated,
-    Skipped,
-}
-
-fn upsert_import_row(
-    service: &AppService,
-    row: ImportSecretRow,
-    on_duplicate: DuplicateStrategy,
-) -> Result<ImportResult, AppError> {
-    let create = CreateSecretRequest {
-        path: row.path.clone(),
-        resource: row.resource.clone(),
-        login: row.login.clone(),
-        password: row.password.clone(),
-        url: row.url.clone(),
-        notes: row.notes.clone(),
-        tags: Some(row.tags.clone()),
-        custom_fields: None,
-    };
-
-    match service.create_secret(create) {
-        Ok(_) => Ok(ImportResult::Imported),
-        Err(AppError::Conflict(_)) => match on_duplicate {
-            DuplicateStrategy::Skip => Ok(ImportResult::Skipped),
-            DuplicateStrategy::Update => {
-                let existing = service.get_secret_by_path(&row.path)?;
-                let update = UpdateSecretRequest {
-                    path: Some(row.path),
-                    resource: row.resource,
-                    login: row.login,
-                    password: Some(row.password),
-                    url: row.url,
-                    notes: row.notes,
-                    tags: Some(row.tags),
-                    custom_fields: None,
-                };
-                service.update_secret(existing.id, update)?;
-                Ok(ImportResult::Updated)
-            }
-        },
-        Err(err) => Err(err),
-    }
-}
-
+#[cfg(test)]
 fn parse_import_csv(
     file: &std::path::Path,
     source: ImportSource,
 ) -> Result<Vec<ImportSecretRow>, AppError> {
+    let mut rows = Vec::new();
+    stream_import_csv(file, source, |_line, row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+fn stream_import_csv(
+    file: &std::path::Path,
+    source: ImportSource,
+    mut on_row: impl FnMut(usize, ImportSecretRow) -> Result<(), AppError>,
+) -> Result<usize, AppError> {
     validate_import_file(file)?;
 
     let mut reader = csv::ReaderBuilder::new()
@@ -397,9 +361,9 @@ fn parse_import_csv(
         .map(|h| h.trim().to_ascii_lowercase())
         .collect::<Vec<_>>();
 
-    let mut rows = Vec::new();
-    for (row_index, record) in reader.records().enumerate() {
-        if row_index >= MAX_IMPORT_ROWS {
+    let mut valid_rows = 0usize;
+    for (record_index, record) in reader.records().enumerate() {
+        if record_index >= MAX_IMPORT_ROWS {
             return Err(AppError::Validation(format!(
                 "CSV import exceeds maximum rows limit ({MAX_IMPORT_ROWS})"
             )));
@@ -420,11 +384,15 @@ fn parse_import_csv(
                 row.insert(header.clone(), trimmed.to_owned());
             }
         }
-        if let Some(parsed) = parse_import_row(&row, source.clone())? {
-            rows.push(parsed);
+        let line = record_index + 2;
+        if let Some(parsed) = parse_import_row(&row, source.clone()).map_err(|err| {
+            AppError::Validation(format!("import row {line} parse failed: {err}"))
+        })? {
+            on_row(line, parsed)?;
+            valid_rows += 1;
         }
     }
-    Ok(rows)
+    Ok(valid_rows)
 }
 
 fn parse_import_row(
@@ -449,12 +417,13 @@ fn parse_generic_row(row: &HashMap<String, String>) -> Result<Option<ImportSecre
         ));
     }
     validate_import_path(path)?;
-    let tags = get_csv_value(row, "tags")
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let tags = row.get("tags").map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    });
     Ok(Some(ImportSecretRow {
         path: path.to_owned(),
         resource: optional_csv_value(row, "resource"),
@@ -507,8 +476,27 @@ fn parse_bitwarden_row(row: &HashMap<String, String>) -> Result<Option<ImportSec
         password: password.to_owned(),
         url: optional_csv_value(row, "login_uri"),
         notes,
-        tags,
+        tags: Some(tags),
     }))
+}
+
+fn map_duplicate_strategy(value: DuplicateStrategy) -> ImportDuplicateStrategy {
+    match value {
+        DuplicateStrategy::Skip => ImportDuplicateStrategy::Skip,
+        DuplicateStrategy::Update => ImportDuplicateStrategy::Update,
+    }
+}
+
+fn to_service_import_row(row: ImportSecretRow) -> ServiceImportSecret {
+    ServiceImportSecret {
+        path: row.path,
+        resource: row.resource,
+        login: row.login,
+        password: row.password,
+        url: row.url,
+        notes: row.notes,
+        tags: row.tags,
+    }
 }
 
 fn get_csv_value<'a>(row: &'a HashMap<String, String>, key: &str) -> &'a str {
@@ -970,7 +958,7 @@ request_timeout_secs = 20
         assert_eq!(parsed.password, "secret");
         assert_eq!(parsed.resource.as_deref(), Some("postgres"));
         assert_eq!(parsed.login.as_deref(), Some("admin"));
-        assert_eq!(parsed.tags, vec!["prod", "db"]);
+        assert_eq!(parsed.tags, Some(vec!["prod".to_owned(), "db".to_owned()]));
     }
 
     #[test]
@@ -1002,7 +990,7 @@ request_timeout_secs = 20
         assert_eq!(parsed.password, "pwd");
         assert_eq!(parsed.login.as_deref(), Some("root"));
         assert_eq!(parsed.resource.as_deref(), Some("login"));
-        assert_eq!(parsed.tags, vec!["prod"]);
+        assert_eq!(parsed.tags, Some(vec!["prod".to_owned()]));
         assert!(
             parsed
                 .notes

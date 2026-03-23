@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use rand::TryRngCore;
+use rusqlite::Transaction;
 use serde_json::Value;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -30,6 +31,30 @@ const ALLOWED_SCOPES: &[&str] = &[
 pub struct AppService {
     storage: Arc<SqliteStorage>,
     crypto: CryptoService,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportSecretRequest {
+    pub path: String,
+    pub resource: Option<String>,
+    pub login: Option<String>,
+    pub password: String,
+    pub url: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ImportDuplicateStrategy {
+    Skip,
+    Update,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    Imported,
+    Updated,
+    Skipped,
 }
 
 impl AppService {
@@ -237,6 +262,76 @@ impl AppService {
         record.last_used_at = Some(now);
         self.storage.update_token(&record)?;
         Ok(to_public_token(record))
+    }
+
+    pub fn run_import_tx<T>(
+        &self,
+        op: impl FnOnce(&Transaction<'_>) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        self.storage.run_import_tx(op)
+    }
+
+    pub fn import_secret_tx(
+        &self,
+        tx: &Transaction<'_>,
+        req: ImportSecretRequest,
+        strategy: ImportDuplicateStrategy,
+    ) -> Result<ImportOutcome, AppError> {
+        let path = required_trim(req.path, "path")?;
+        let password = required_trim(req.password, "password")?;
+        let existing = self.storage.get_secret_by_path_tx(tx, &path)?;
+        let now = now_unix();
+
+        if let Some(mut record) = existing {
+            if matches!(strategy, ImportDuplicateStrategy::Skip) {
+                return Ok(ImportOutcome::Skipped);
+            }
+
+            record.path = path;
+            if let Some(resource) = req.resource {
+                record.resource = optional_trim(Some(resource));
+            }
+            if let Some(login) = req.login {
+                record.login = optional_trim(Some(login));
+            }
+            record.password_encrypted = self.crypto.encrypt_string(&password)?;
+            if let Some(url) = req.url {
+                record.url = optional_trim(Some(url));
+            }
+            if let Some(notes) = req.notes {
+                record.notes_encrypted = maybe_encrypt_text(
+                    &self.crypto,
+                    optional_trim(Some(notes)).as_deref(),
+                    self.crypto.encrypt_notes,
+                )?;
+            }
+            if let Some(tags) = req.tags {
+                record.tags = normalize_tags(tags)?;
+            }
+            record.updated_at = now;
+            self.storage.update_secret_tx(tx, &record)?;
+            return Ok(ImportOutcome::Updated);
+        }
+
+        let record = SecretRecord {
+            id: Uuid::new_v4(),
+            path,
+            resource: optional_trim(req.resource),
+            login: optional_trim(req.login),
+            password_encrypted: self.crypto.encrypt_string(&password)?,
+            url: optional_trim(req.url),
+            notes_encrypted: maybe_encrypt_text(
+                &self.crypto,
+                optional_trim(req.notes).as_deref(),
+                self.crypto.encrypt_notes,
+            )?,
+            tags: normalize_tags(req.tags.unwrap_or_default())?,
+            custom_fields_encrypted: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.storage.insert_secret_tx(tx, &record)?;
+        Ok(ImportOutcome::Imported)
     }
 
     fn to_secret(&self, record: SecretRecord) -> Result<Secret, AppError> {

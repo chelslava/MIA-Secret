@@ -5,6 +5,7 @@ use std::process::Command;
 use mia_secret::api;
 use mia_secret::bootstrap;
 use mia_secret::config::Config;
+use rusqlite::Connection;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -143,6 +144,28 @@ fn stdout_text(output: &std::process::Output) -> String {
 
 fn stderr_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn db_path_from_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .expect("config parent")
+        .join("data")
+        .join("secrets.db")
+}
+
+fn count_secrets(db_path: &Path) -> i64 {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    conn.query_row("SELECT COUNT(1) FROM secrets", [], |row| row.get(0))
+        .expect("count secrets")
+}
+
+fn read_secret_tags(db_path: &Path, path: &str) -> String {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    conn.query_row("SELECT tags FROM secrets WHERE path = ?1", [path], |row| {
+        row.get(0)
+    })
+    .expect("read tags")
 }
 
 #[test]
@@ -320,6 +343,137 @@ fn cli_import_csv_generic_works_and_reports_summary() {
         stdout_text(&import).contains("Import summary: imported=1"),
         "unexpected import output: {}",
         stdout_text(&import)
+    );
+}
+
+#[test]
+fn cli_import_csv_is_atomic_and_rolls_back_on_row_error() {
+    let root = TestDir::new("import-atomic");
+    let config_path = root.path().join("mia-secret.toml");
+    write_importable_config(&config_path);
+    let csv_path = root.path().join("import-atomic.csv");
+    fs::write(
+        &csv_path,
+        "path,password,resource\napps/prod/db,secret,postgres\napps/prod/api,,service\n",
+    )
+    .expect("write import csv");
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let file_arg = csv_path.to_string_lossy().into_owned();
+    let import = run_cli(
+        root.path(),
+        &[
+            "--config",
+            &config_arg,
+            "import",
+            "csv",
+            "--file",
+            &file_arg,
+            "--source",
+            "generic",
+            "--on-duplicate",
+            "update",
+        ],
+    );
+    assert!(
+        !import.status.success(),
+        "import must fail, stdout={}, stderr={}",
+        stdout_text(&import),
+        stderr_text(&import)
+    );
+    assert_eq!(
+        import.status.code(),
+        Some(2),
+        "validation failure should map to exit code 2"
+    );
+    assert!(
+        stderr_text(&import).contains("import row"),
+        "stderr should contain row context: {}",
+        stderr_text(&import)
+    );
+
+    let db_path = db_path_from_config(&config_path);
+    assert_eq!(
+        count_secrets(&db_path),
+        0,
+        "failed atomic import must not persist partial data"
+    );
+}
+
+#[test]
+fn cli_import_update_keeps_existing_tags_when_column_missing() {
+    let root = TestDir::new("import-tags-keep");
+    let config_path = root.path().join("mia-secret.toml");
+    write_importable_config(&config_path);
+
+    let csv_initial = root.path().join("import-initial.csv");
+    fs::write(
+        &csv_initial,
+        "path,password,resource,tags\napps/prod/db,secret-1,postgres,\"prod,db\"\n",
+    )
+    .expect("write initial csv");
+
+    let csv_update = root.path().join("import-update.csv");
+    fs::write(
+        &csv_update,
+        "path,password,resource\napps/prod/db,secret-2,postgres-updated\n",
+    )
+    .expect("write update csv");
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let initial_file_arg = csv_initial.to_string_lossy().into_owned();
+    let update_file_arg = csv_update.to_string_lossy().into_owned();
+
+    let first = run_cli(
+        root.path(),
+        &[
+            "--config",
+            &config_arg,
+            "import",
+            "csv",
+            "--file",
+            &initial_file_arg,
+            "--source",
+            "generic",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "initial import failed: stderr={}",
+        stderr_text(&first)
+    );
+
+    let second = run_cli(
+        root.path(),
+        &[
+            "--config",
+            &config_arg,
+            "import",
+            "csv",
+            "--file",
+            &update_file_arg,
+            "--source",
+            "generic",
+            "--on-duplicate",
+            "update",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "update import failed: stderr={}",
+        stderr_text(&second)
+    );
+    assert!(
+        stdout_text(&second).contains("updated=1"),
+        "unexpected update output: {}",
+        stdout_text(&second)
+    );
+
+    let db_path = db_path_from_config(&config_path);
+    assert_eq!(
+        read_secret_tags(&db_path, "apps/prod/db"),
+        "[\"prod\",\"db\"]",
+        "tags must remain unchanged when tags column is absent in CSV update"
     );
 }
 

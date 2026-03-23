@@ -201,18 +201,7 @@ impl SqliteStorage {
 
     pub fn get_secret_by_path(&self, path: &str) -> Result<Option<SecretRecord>, AppError> {
         let conn = self.open_conn()?;
-        conn.query_row(
-            r#"
-            SELECT
-                id, path, resource, login, password_encrypted, url,
-                notes_encrypted, tags, custom_fields_encrypted, created_at, updated_at
-            FROM secrets WHERE path = ?1
-            "#,
-            [path],
-            map_secret_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        get_secret_by_path_in_tx(&conn, path)
     }
 
     pub fn insert_token(&self, token: &TokenRecord) -> Result<(), AppError> {
@@ -332,6 +321,104 @@ impl SqliteStorage {
         Ok(result)
     }
 
+    pub fn run_import_tx<T>(
+        &self,
+        op: impl FnOnce(&Transaction<'_>) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        if self.options.create_backup_before_write {
+            self.backup_database()?;
+        }
+        let mut conn = self.open_conn()?;
+        let tx = conn.transaction()?;
+        let result = op(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn get_secret_by_path_tx(
+        &self,
+        tx: &Transaction<'_>,
+        path: &str,
+    ) -> Result<Option<SecretRecord>, AppError> {
+        get_secret_by_path_in_tx(tx, path)
+    }
+
+    pub fn insert_secret_tx(
+        &self,
+        tx: &Transaction<'_>,
+        secret: &SecretRecord,
+    ) -> Result<(), AppError> {
+        let tags = serde_json::to_string(&secret.tags)
+            .map_err(|e| AppError::Serialization(format!("failed to serialize tags: {e}")))?;
+        let result = tx.execute(
+            r#"
+            INSERT INTO secrets (
+                id, path, resource, login, password_encrypted, url,
+                notes_encrypted, tags, custom_fields_encrypted, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+            params![
+                secret.id.to_string(),
+                secret.path,
+                secret.resource,
+                secret.login,
+                secret.password_encrypted,
+                secret.url,
+                secret.notes_encrypted,
+                tags,
+                secret.custom_fields_encrypted,
+                secret.created_at,
+                secret.updated_at
+            ],
+        );
+        map_sqlite_write_result(result, "secret")
+    }
+
+    pub fn update_secret_tx(
+        &self,
+        tx: &Transaction<'_>,
+        secret: &SecretRecord,
+    ) -> Result<(), AppError> {
+        let tags = serde_json::to_string(&secret.tags)
+            .map_err(|e| AppError::Serialization(format!("failed to serialize tags: {e}")))?;
+        let changed = tx.execute(
+            r#"
+            UPDATE secrets SET
+                path = ?2,
+                resource = ?3,
+                login = ?4,
+                password_encrypted = ?5,
+                url = ?6,
+                notes_encrypted = ?7,
+                tags = ?8,
+                custom_fields_encrypted = ?9,
+                updated_at = ?10
+            WHERE id = ?1
+            "#,
+            params![
+                secret.id.to_string(),
+                secret.path,
+                secret.resource,
+                secret.login,
+                secret.password_encrypted,
+                secret.url,
+                secret.notes_encrypted,
+                tags,
+                secret.custom_fields_encrypted,
+                secret.updated_at
+            ],
+        );
+        let changed = map_sqlite_write_rows(changed, "secret")?;
+        if changed == 0 {
+            return Err(AppError::NotFound(format!(
+                "secret not found: {}",
+                secret.id
+            )));
+        }
+        Ok(())
+    }
+
     fn backup_database(&self) -> Result<(), AppError> {
         if !self.db_path.exists() {
             return Ok(());
@@ -376,6 +463,21 @@ impl SqliteStorage {
         ))?;
         Ok(conn)
     }
+}
+
+fn get_secret_by_path_in_tx(conn: &Connection, path: &str) -> Result<Option<SecretRecord>, AppError> {
+    conn.query_row(
+        r#"
+        SELECT
+            id, path, resource, login, password_encrypted, url,
+            notes_encrypted, tags, custom_fields_encrypted, created_at, updated_at
+        FROM secrets WHERE path = ?1
+        "#,
+        [path],
+        map_secret_row,
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn map_secret_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretRecord> {
