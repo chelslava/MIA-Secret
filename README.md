@@ -53,7 +53,7 @@ cargo run -- health
 
 По умолчанию сервер слушает `127.0.0.1:3765`, а данные хранятся в `./data/secrets.db`.
 
-## Init И Serve
+## Init и Serve
 
 ### Инициализация
 
@@ -99,7 +99,7 @@ cargo run -- config validate
 
 Для явного файла конфигурации используйте `--config path/to/file.toml`.
 
-## CLI Примеры
+## CLI примеры
 
 ### Секреты
 
@@ -153,7 +153,7 @@ cargo run -- token list
 cargo run -- token revoke 2f4c6f3f-1b43-4f89-8d66-3a1f6d7e8f10
 ```
 
-### Импорт Из Других Менеджеров
+### Импорт из других менеджеров
 
 Импорт из CSV:
 
@@ -162,7 +162,7 @@ cargo run -- import csv --file ./exports/generic.csv --source generic
 cargo run -- import csv --file ./exports/bitwarden.csv --source bitwarden --on-duplicate update
 ```
 
-## Токен Через Env
+## Токен через Env
 
 CLI-команды, которые обращаются к локальному HTTP API, читают токен из переменной окружения `MIA_SECRET_TOKEN`.
 
@@ -190,7 +190,7 @@ $env:MIA_SECRET__GENERAL__LOG_LEVEL = "debug"
 * Секреты, заметки и пользовательские поля могут шифроваться в зависимости от конфигурации `crypto`.
 * При создании первого токена доступ обычно открыт, а последующие операции с токенами требуют `tokens.manage`.
 
-## API Эндпоинты
+## API эндпоинты
 
 Сервер публикует API под префиксом `/api/v1`.
 
