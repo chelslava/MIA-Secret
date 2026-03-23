@@ -589,7 +589,10 @@ async fn contract_token_revoke_edge_errors() {
     assert_error_contract(&invalid_uuid_json, "validation_error");
 
     let missing_revoke = client
-        .post(format!("{base_url}/api/v1/tokens/{}/revoke", Uuid::new_v4()))
+        .post(format!(
+            "{base_url}/api/v1/tokens/{}/revoke",
+            Uuid::new_v4()
+        ))
         .bearer_auth(&token)
         .send()
         .await

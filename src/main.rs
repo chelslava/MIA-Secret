@@ -385,9 +385,9 @@ fn stream_import_csv(
             }
         }
         let line = record_index + 2;
-        if let Some(parsed) = parse_import_row(&row, source.clone()).map_err(|err| {
-            AppError::Validation(format!("import row {line} parse failed: {err}"))
-        })? {
+        if let Some(parsed) = parse_import_row(&row, source.clone())
+            .map_err(|err| AppError::Validation(format!("import row {line} parse failed: {err}")))?
+        {
             on_row(line, parsed)?;
             valid_rows += 1;
         }
@@ -646,8 +646,8 @@ fn exit_code_for_error(err: &AppError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigCommands, MAX_IMPORT_FIELD_LENGTH, MAX_IMPORT_FILE_SIZE_BYTES, exit_code_for_error,
-        MAX_IMPORT_ROWS, load_command_config, map_api_error, parse_bitwarden_row,
+        ConfigCommands, MAX_IMPORT_FIELD_LENGTH, MAX_IMPORT_FILE_SIZE_BYTES, MAX_IMPORT_ROWS,
+        exit_code_for_error, load_command_config, map_api_error, parse_bitwarden_row,
         parse_generic_row, parse_import_csv, request_json, validate_import_file,
     };
     use crate::config::Config;
@@ -1070,7 +1070,9 @@ request_timeout_secs = 20
 
         let err = parse_import_csv(&csv_path, super::ImportSource::Generic)
             .expect_err("must fail for too many rows");
-        assert!(matches!(err, AppError::Validation(message) if message.contains("maximum rows limit")));
+        assert!(
+            matches!(err, AppError::Validation(message) if message.contains("maximum rows limit"))
+        );
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

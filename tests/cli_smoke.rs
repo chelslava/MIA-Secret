@@ -807,7 +807,10 @@ async fn cli_update_missing_secret_returns_not_found_exit_code() {
         ],
         &[("MIA_SECRET_TOKEN", token.as_str())],
     );
-    assert!(!update.status.success(), "update should fail for missing path");
+    assert!(
+        !update.status.success(),
+        "update should fail for missing path"
+    );
     assert_eq!(
         update.status.code(),
         Some(4),
@@ -866,7 +869,10 @@ async fn cli_delete_missing_secret_returns_not_found_exit_code() {
         &["--config", &config_arg, "delete", "missing/secret/path"],
         &[("MIA_SECRET_TOKEN", token.as_str())],
     );
-    assert!(!delete.status.success(), "delete should fail for missing path");
+    assert!(
+        !delete.status.success(),
+        "delete should fail for missing path"
+    );
     assert_eq!(
         delete.status.code(),
         Some(4),

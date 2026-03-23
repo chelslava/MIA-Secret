@@ -465,7 +465,10 @@ impl SqliteStorage {
     }
 }
 
-fn get_secret_by_path_in_tx(conn: &Connection, path: &str) -> Result<Option<SecretRecord>, AppError> {
+fn get_secret_by_path_in_tx(
+    conn: &Connection,
+    path: &str,
+) -> Result<Option<SecretRecord>, AppError> {
     conn.query_row(
         r#"
         SELECT
