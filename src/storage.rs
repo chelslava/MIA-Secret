@@ -8,6 +8,8 @@ use crate::config::Config;
 use crate::domain::{SecretRecord, TokenRecord};
 use crate::error::AppError;
 
+const MIGRATIONS: &[(&str, &str)] = &[("001_init.sql", include_str!("../migrations/001_init.sql"))];
+
 #[derive(Debug, Clone)]
 pub struct StorageOptions {
     pub create_backup_before_write: bool,
@@ -59,38 +61,19 @@ impl SqliteStorage {
     }
 
     pub fn migrate(&self) -> Result<(), AppError> {
-        let conn = self.open_conn()?;
+        let mut conn = self.open_conn()?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
-
-            CREATE TABLE IF NOT EXISTS secrets (
-                id TEXT PRIMARY KEY NOT NULL,
-                path TEXT NOT NULL UNIQUE,
-                resource TEXT NULL,
-                login TEXT NULL,
-                password_encrypted TEXT NOT NULL,
-                url TEXT NULL,
-                notes_encrypted TEXT NULL,
-                tags TEXT NOT NULL,
-                custom_fields_encrypted TEXT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS tokens (
-                id TEXT PRIMARY KEY NOT NULL,
-                name TEXT NOT NULL,
-                token_hash TEXT NOT NULL UNIQUE,
-                scopes TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NULL,
-                revoked_at INTEGER NULL,
-                last_used_at INTEGER NULL
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                applied_at INTEGER NOT NULL
             );
             "#,
         )?;
+        apply_migrations(&mut conn)?;
         Ok(())
     }
 
@@ -457,4 +440,36 @@ fn map_sqlite_write_rows(result: rusqlite::Result<usize>, entity: &str) -> Resul
         }
         Err(other) => Err(AppError::Storage(other.to_string())),
     }
+}
+
+fn apply_migrations(conn: &mut Connection) -> Result<(), AppError> {
+    for (name, sql) in MIGRATIONS {
+        let already_applied: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM schema_migrations WHERE name = ?1",
+                [*name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if already_applied.is_some() {
+            continue;
+        }
+
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
+            params![*name, current_unix_ts()],
+        )?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+fn current_unix_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
