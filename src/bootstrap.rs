@@ -1,8 +1,8 @@
 use std::fs::{self, OpenOptions};
+#[cfg(any(unix, not(windows)))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
+
 use zeroize::Zeroize;
 
 use crate::config::Config;
@@ -31,7 +31,6 @@ fn ensure_parent_dir(path: &Path) -> Result<(), AppError> {
     {
         fs::create_dir_all(parent)?;
     }
-
     Ok(())
 }
 
@@ -39,15 +38,12 @@ fn ensure_file(path: &Path) -> Result<(), AppError> {
     if path.exists() {
         return Ok(());
     }
-
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
-
     OpenOptions::new().create_new(true).write(true).open(path)?;
-
     Ok(())
 }
 
@@ -55,7 +51,6 @@ fn ensure_random_file(path: &Path, len: usize) -> Result<(), AppError> {
     if path.exists() {
         return Ok(());
     }
-
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -65,23 +60,40 @@ fn ensure_random_file(path: &Path, len: usize) -> Result<(), AppError> {
     let mut bytes = vec![0u8; len];
     fill_random_bytes(&mut bytes)?;
 
+    #[cfg(windows)]
+    {
+        create_secure_file_windows(path, &bytes)?;
+        bytes.zeroize();
+        return Ok(());
+    }
+
     #[cfg(unix)]
-    let mut file = {
+    {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(path)?
-    };
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        bytes.zeroize();
+        return Ok(());
+    }
 
-    #[cfg(not(unix))]
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
-    file.write_all(&bytes)?;
-    file.flush()?;
-    bytes.zeroize();
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        bytes.zeroize();
+        return Ok(());
+    }
 
-    Ok(())
+    #[allow(unreachable_code)]
+    Err(AppError::Server(
+        "secure file creation is not supported on this platform".to_owned(),
+    ))
 }
 
 fn secure_master_key_permissions(path: &Path) -> Result<(), AppError> {
@@ -96,46 +108,348 @@ fn secure_master_key_permissions(path: &Path) -> Result<(), AppError> {
 
     #[cfg(windows)]
     {
-        let username = std::env::var("USERNAME").map_err(|err| {
-            AppError::Server(format!("unable to detect current Windows user: {err}"))
-        })?;
-        for args in [
-            vec!["/inheritance:r".to_owned()],
-            vec!["/grant:r".to_owned(), format!("{username}:(R,W)")],
-            vec!["/remove:g".to_owned(), "Users".to_owned()],
-            vec!["/remove:g".to_owned(), "Authenticated Users".to_owned()],
-        ] {
-            if let Err(err) = run_icacls(path, &args) {
-                tracing::warn!("master.key ACL hardening failed: {}", err);
-            }
-        }
+        secure_master_key_permissions_windows(path)?;
     }
 
     Ok(())
 }
 
 #[cfg(windows)]
-fn run_icacls(path: &Path, args: &[String]) -> Result<(), AppError> {
-    let output = Command::new("icacls").arg(path).args(args).output()?;
-    if output.status.success() {
+fn secure_master_key_permissions_windows(path: &Path) -> Result<(), AppError> {
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl};
+
+    let current_user_sid = get_current_user_sid_string()?;
+    if verify_master_key_acl(path, &current_user_sid).is_ok() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(AppError::Server(format!(
-        "failed to harden ACL for {}: stdout='{}' stderr='{}'",
-        path.display(),
-        stdout.trim(),
-        stderr.trim()
-    )))
+    let sddl = format!("D:P(A;;GRGW;;;{current_user_sid})(A;;FA;;;SY)");
+    let sddl_wide = to_wide_nul(&sddl);
+    let path_wide = to_wide_nul(path.to_string_lossy().as_ref());
+
+    let mut security_descriptor = std::ptr::null_mut();
+    let parsed = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut security_descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if parsed == 0 || security_descriptor.is_null() {
+        return Err(AppError::Server(format!(
+            "failed to parse ACL SDDL (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let mut dacl_present = 0i32;
+    let mut dacl_defaulted = 0i32;
+    let mut dacl = std::ptr::null_mut();
+    let dacl_ok = unsafe {
+        GetSecurityDescriptorDacl(
+            security_descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    };
+    if dacl_ok == 0 || dacl_present == 0 || dacl.is_null() {
+        unsafe {
+            let _ = LocalFree(security_descriptor);
+        }
+        return Err(AppError::Server(format!(
+            "failed to extract DACL from security descriptor (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let applied = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        let _ = LocalFree(security_descriptor);
+    }
+    if applied != 0 {
+        return Err(AppError::Server(format!(
+            "failed to set ACL on {} (SetNamedSecurityInfoW code={})",
+            path.display(),
+            applied
+        )));
+    }
+
+    verify_master_key_acl(path, &current_user_sid)
+}
+
+#[cfg(windows)]
+fn create_secure_file_windows(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        WriteFile,
+    };
+
+    let current_user_sid = get_current_user_sid_string()?;
+    let sddl = format!("D:P(A;;GRGW;;;{current_user_sid})(A;;FA;;;SY)");
+    let sddl_wide = to_wide_nul(&sddl);
+    let path_wide = to_wide_nul(path.to_string_lossy().as_ref());
+
+    let mut security_descriptor = std::ptr::null_mut();
+    let parsed = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut security_descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if parsed == 0 || security_descriptor.is_null() {
+        return Err(AppError::Server(format!(
+            "failed to parse ACL SDDL for secure file creation (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor,
+        bInheritHandle: 0,
+    };
+
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            FILE_GENERIC_WRITE,
+            FILE_SHARE_READ,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        unsafe {
+            let _ = LocalFree(security_descriptor);
+        }
+        return Err(AppError::Server(format!(
+            "CreateFileW failed for {} (GetLastError={})",
+            path.display(),
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let mut written = 0u32;
+    let write_ok = unsafe {
+        WriteFile(
+            handle,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        let _ = LocalFree(security_descriptor);
+        let _ = CloseHandle(handle);
+    }
+    if write_ok == 0 || written != bytes.len() as u32 {
+        return Err(AppError::Server(format!(
+            "WriteFile failed for {} (GetLastError={})",
+            path.display(),
+            unsafe { GetLastError() }
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_master_key_acl(path: &Path, current_user_sid: &str) -> Result<(), AppError> {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+    let path_wide = to_wide_nul(path.to_string_lossy().as_ref());
+    let mut security_descriptor = std::ptr::null_mut();
+    let get_result = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if get_result != ERROR_SUCCESS {
+        return Err(AppError::Server(format!(
+            "failed to read ACL for {} (code {})",
+            path.display(),
+            get_result
+        )));
+    }
+
+    let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
+    let to_sddl = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            security_descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut sddl_ptr,
+            std::ptr::null_mut(),
+        )
+    };
+    if to_sddl == 0 || sddl_ptr.is_null() {
+        unsafe {
+            let _ = LocalFree(security_descriptor);
+        }
+        return Err(AppError::Server("failed to convert ACL to SDDL".to_owned()));
+    }
+
+    let sddl = pwstr_to_string(sddl_ptr);
+    unsafe {
+        let _ = LocalFree(sddl_ptr as *mut _);
+        let _ = LocalFree(security_descriptor);
+    }
+
+    if !sddl.contains(current_user_sid) {
+        return Err(AppError::Server(format!(
+            "ACL validation failed: current user SID is missing for {}",
+            path.display()
+        )));
+    }
+    if sddl.contains(";;;WD)") || sddl.contains(";;;AU)") || sddl.contains(";;;BU)") {
+        return Err(AppError::Server(format!(
+            "ACL validation failed: insecure principal is present for {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn get_current_user_sid_string() -> Result<String, AppError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    let open_ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if open_ok == 0 {
+        return Err(AppError::Server(format!(
+            "OpenProcessToken failed (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let mut token_info_len = 0u32;
+    let _ = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut token_info_len,
+        )
+    };
+    if token_info_len == 0 {
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        return Err(AppError::Server(
+            "GetTokenInformation returned zero length".to_owned(),
+        ));
+    }
+
+    let mut buffer = vec![0u8; token_info_len as usize];
+    let info_ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr() as *mut _,
+            token_info_len,
+            &mut token_info_len,
+        )
+    };
+    if info_ok == 0 {
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        return Err(AppError::Server(format!(
+            "GetTokenInformation(TokenUser) failed (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let token_user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    let mut sid_ptr: *mut u16 = std::ptr::null_mut();
+    let sid_ok = unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_ptr) };
+    if sid_ok == 0 || sid_ptr.is_null() {
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        return Err(AppError::Server(format!(
+            "ConvertSidToStringSidW failed (GetLastError={})",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let sid = pwstr_to_string(sid_ptr);
+    unsafe {
+        let _ = LocalFree(sid_ptr as *mut _);
+        let _ = CloseHandle(token);
+    }
+    Ok(sid)
+}
+
+#[cfg(windows)]
+fn to_wide_nul(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn pwstr_to_string(p: *mut u16) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+    }
 }
 
 fn fill_random_bytes(buffer: &mut [u8]) -> Result<(), AppError> {
     #[cfg(target_family = "unix")]
     {
         use std::io::Read;
-
         let mut file = fs::File::open("/dev/urandom")?;
         file.read_exact(buffer)?;
         return Ok(());
@@ -160,7 +474,6 @@ fn fill_random_bytes(buffer: &mut [u8]) -> Result<(), AppError> {
             }
             offset += chunk_len;
         }
-
         return Ok(());
     }
 

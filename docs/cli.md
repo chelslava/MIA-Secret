@@ -1,6 +1,16 @@
 # CLI
 
-Все команды запускаются через `cargo run -- <command>`.
+Основной способ запуска CLI после сборки:
+
+```bash
+mia-secret <command>
+```
+
+Для разработки можно использовать:
+
+```bash
+cargo run -- <command>
+```
 
 ## Общие Опции
 
@@ -20,8 +30,8 @@
 Примеры:
 
 ```bash
-cargo run -- serve
-cargo run -- serve --host 127.0.0.1 --port 3765
+mia-secret serve
+mia-secret serve --host 127.0.0.1 --port 3765
 ```
 
 ### `health`
@@ -35,7 +45,7 @@ cargo run -- serve --host 127.0.0.1 --port 3765
 Пример:
 
 ```bash
-cargo run -- health --port 3765
+mia-secret health --port 3765
 ```
 
 ### `init`
@@ -45,7 +55,7 @@ cargo run -- health --port 3765
 Пример:
 
 ```bash
-cargo run -- init
+mia-secret init
 ```
 
 ### `add`
@@ -68,7 +78,7 @@ cargo run -- init
 Пример:
 
 ```bash
-cargo run -- add apps/prod/db --resource "PostgreSQL" --login admin --password "S3cret!" --tags prod,db
+mia-secret add apps/prod/db --resource "PostgreSQL" --login admin --password "S3cret!" --tags prod,db
 ```
 
 ### `get`
@@ -82,7 +92,7 @@ cargo run -- add apps/prod/db --resource "PostgreSQL" --login admin --password "
 Пример:
 
 ```bash
-cargo run -- get apps/prod/db
+mia-secret get apps/prod/db
 ```
 
 ### `list`
@@ -92,7 +102,7 @@ cargo run -- get apps/prod/db
 Пример:
 
 ```bash
-cargo run -- list
+mia-secret list
 ```
 
 ### `update`
@@ -116,7 +126,7 @@ cargo run -- list
 Пример:
 
 ```bash
-cargo run -- update apps/prod/db --login readonly --tags prod,db,readonly
+mia-secret update apps/prod/db --login readonly --tags prod,db,readonly
 ```
 
 ### `delete`
@@ -130,7 +140,7 @@ cargo run -- update apps/prod/db --login readonly --tags prod,db,readonly
 Пример:
 
 ```bash
-cargo run -- delete apps/prod/db
+mia-secret delete apps/prod/db
 ```
 
 ### `token`
@@ -153,7 +163,7 @@ cargo run -- delete apps/prod/db
 Пример:
 
 ```bash
-cargo run -- token create "ops-token" --scopes secrets.read,secrets.list
+mia-secret token create "ops-token" --scopes secrets.read,secrets.list
 ```
 
 #### `token list`
@@ -163,7 +173,7 @@ cargo run -- token create "ops-token" --scopes secrets.read,secrets.list
 Пример:
 
 ```bash
-cargo run -- token list
+mia-secret token list
 ```
 
 #### `token revoke`
@@ -177,7 +187,7 @@ cargo run -- token list
 Пример:
 
 ```bash
-cargo run -- token revoke 8ce4eb74-ff4d-4a02-9b2f-5b53a2f2cb87
+mia-secret token revoke 8ce4eb74-ff4d-4a02-9b2f-5b53a2f2cb87
 ```
 
 ### `config`
@@ -195,7 +205,7 @@ cargo run -- token revoke 8ce4eb74-ff4d-4a02-9b2f-5b53a2f2cb87
 Пример:
 
 ```bash
-cargo run -- config init --force
+mia-secret config init --force
 ```
 
 #### `config show`
@@ -205,7 +215,7 @@ cargo run -- config init --force
 Пример:
 
 ```bash
-cargo run -- config show
+mia-secret config show
 ```
 
 #### `config validate`
@@ -215,7 +225,7 @@ cargo run -- config show
 Пример:
 
 ```bash
-cargo run -- config validate
+mia-secret config validate
 ```
 
 ## Токен Для Клиентских Команд
@@ -226,7 +236,7 @@ cargo run -- config validate
 
 ```bash
 $env:MIA_SECRET_TOKEN = "eyJ..."
-cargo run -- list
+mia-secret list
 ```
 
 Если токен не задан, защищенные вызовы вернут `401 Unauthorized`.

@@ -34,7 +34,7 @@
 1. [x] Добавить явный middleware-пайплайн: auth bearer, scope-check, trace-id, request timeout.
 2. [x] Добавить строгую политику логирования с редактированием чувствительных данных.
 3. [x] Усилить работу с секретами в памяти (zeroize для критичных временных буферов в crypto/bootstrap/service).
-4. [~] Ограничить права на `master.key` на уровне ОС (Unix: `0600` готово, Windows: best-effort ACL через `icacls`).
+4. [x] Ограничить права на `master.key` на уровне ОС (Unix: `0600`, Windows: WinAPI ACL + верификация, без `icacls`).
 
 ### 2. Хранилище и транзакционность (высокий приоритет)
 1. [x] Ввести явные транзакции для операций записи (create/update/delete, revoke, last_used_at update).
@@ -62,4 +62,4 @@
 - [x] Базовый API и CLI работают.
 - [x] Чувствительные поля секретов хранятся в шифрованном виде.
 - [~] Полный security hardening и эксплуатационные требования (backup/ACL/log-redaction/zeroize) требуют доработки.
-- [~] Полный security hardening и эксплуатационные требования (в основном остается надежный Windows ACL-hardening без best-effort) требуют доработки.
+- [x] Критичные security hardening-пункты закрыты (middleware, redaction, zeroize, ACL-hardening).
