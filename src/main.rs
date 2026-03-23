@@ -49,7 +49,7 @@ async fn dispatch(cli: Cli) -> Result<(), AppError> {
             config::write_default_if_missing(&path)?;
             let cfg = config::load(&path, config::ConfigOverrides::default())?;
             bootstrap::ensure_layout(&cfg)?;
-            let _storage = SqliteStorage::new(&cfg.general.database_path)?;
+            let _storage = SqliteStorage::from_config(&cfg)?;
             println!("Initialized data directory at {}", cfg.general.data_dir);
             Ok(())
         }

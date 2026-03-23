@@ -8,7 +8,7 @@ use mia_secret::crypto::CryptoService;
 use mia_secret::domain::{CreateSecretRequest, CreateTokenRequest, UpdateSecretRequest};
 use mia_secret::error::AppError;
 use mia_secret::service::AppService;
-use mia_secret::storage::SqliteStorage;
+use mia_secret::storage::{SqliteStorage, StorageOptions};
 use rusqlite::Connection;
 use serde_json::json;
 use uuid::Uuid;
@@ -290,4 +290,48 @@ fn secret_crud_roundtrip_and_plaintext_is_not_written_to_sqlite() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn storage_backup_rotation_keeps_configured_limit() {
+    let root = TestDir::new("backup-rotation");
+    let cfg = test_config(root.path());
+    write_master_key(&cfg);
+
+    let backup_dir = root.path().join("backup-artifacts");
+    let options = StorageOptions {
+        create_backup_before_write: true,
+        max_backups: 2,
+        backup_dir: backup_dir.clone(),
+    };
+    let storage = SqliteStorage::new_with_options(&cfg.general.database_path, options)
+        .expect("storage with backup options");
+    let crypto = CryptoService::from_config(&cfg).expect("crypto init");
+    let service = AppService::new(Arc::new(storage), crypto);
+
+    for index in 0..4 {
+        let _ = service
+            .create_secret(CreateSecretRequest {
+                path: format!("backup/item-{index}"),
+                resource: None,
+                login: None,
+                password: format!("pwd-{index}"),
+                url: None,
+                notes: None,
+                tags: None,
+                custom_fields: None,
+            })
+            .expect("create secret for backup");
+    }
+
+    let backup_files = fs::read_dir(&backup_dir)
+        .expect("read backup directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count();
+
+    assert!(
+        backup_files <= 2,
+        "expected no more than 2 backups, got {backup_files}"
+    );
 }

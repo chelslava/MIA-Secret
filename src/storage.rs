@@ -1,20 +1,58 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
+use crate::config::Config;
 use crate::domain::{SecretRecord, TokenRecord};
 use crate::error::AppError;
 
 #[derive(Debug, Clone)]
+pub struct StorageOptions {
+    pub create_backup_before_write: bool,
+    pub max_backups: usize,
+    pub backup_dir: PathBuf,
+}
+
+impl Default for StorageOptions {
+    fn default() -> Self {
+        Self {
+            create_backup_before_write: false,
+            max_backups: 10,
+            backup_dir: PathBuf::from("./data/backups"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SqliteStorage {
     db_path: PathBuf,
+    options: StorageOptions,
 }
 
 impl SqliteStorage {
+    #[allow(dead_code)]
     pub fn new(path: impl AsRef<Path>) -> Result<Self, AppError> {
+        Self::new_with_options(path, StorageOptions::default())
+    }
+
+    pub fn from_config(cfg: &Config) -> Result<Self, AppError> {
+        let options = StorageOptions {
+            create_backup_before_write: cfg.storage.create_backup_before_write,
+            max_backups: cfg.storage.max_backups.max(1) as usize,
+            backup_dir: PathBuf::from(&cfg.general.data_dir).join("backups"),
+        };
+        Self::new_with_options(&cfg.general.database_path, options)
+    }
+
+    pub fn new_with_options(
+        path: impl AsRef<Path>,
+        options: StorageOptions,
+    ) -> Result<Self, AppError> {
         let storage = Self {
             db_path: path.as_ref().to_path_buf(),
+            options,
         };
         storage.migrate()?;
         Ok(storage)
@@ -63,82 +101,85 @@ impl SqliteStorage {
     }
 
     pub fn insert_secret(&self, secret: &SecretRecord) -> Result<(), AppError> {
-        let conn = self.open_conn()?;
         let tags = serde_json::to_string(&secret.tags)
             .map_err(|e| AppError::Serialization(format!("failed to serialize tags: {e}")))?;
-        let result = conn.execute(
-            r#"
-            INSERT INTO secrets (
-                id, path, resource, login, password_encrypted, url,
-                notes_encrypted, tags, custom_fields_encrypted, created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            "#,
-            params![
-                secret.id.to_string(),
-                secret.path,
-                secret.resource,
-                secret.login,
-                secret.password_encrypted,
-                secret.url,
-                secret.notes_encrypted,
-                tags,
-                secret.custom_fields_encrypted,
-                secret.created_at,
-                secret.updated_at
-            ],
-        );
-        map_sqlite_write_result(result, "secret")
+        self.run_write_tx("secret", move |tx| {
+            let result = tx.execute(
+                r#"
+                INSERT INTO secrets (
+                    id, path, resource, login, password_encrypted, url,
+                    notes_encrypted, tags, custom_fields_encrypted, created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    secret.id.to_string(),
+                    secret.path,
+                    secret.resource,
+                    secret.login,
+                    secret.password_encrypted,
+                    secret.url,
+                    secret.notes_encrypted,
+                    tags,
+                    secret.custom_fields_encrypted,
+                    secret.created_at,
+                    secret.updated_at
+                ],
+            );
+            map_sqlite_write_result(result, "secret")
+        })
     }
 
     pub fn update_secret(&self, secret: &SecretRecord) -> Result<(), AppError> {
-        let conn = self.open_conn()?;
         let tags = serde_json::to_string(&secret.tags)
             .map_err(|e| AppError::Serialization(format!("failed to serialize tags: {e}")))?;
-        let changed = conn.execute(
-            r#"
-            UPDATE secrets SET
-                path = ?2,
-                resource = ?3,
-                login = ?4,
-                password_encrypted = ?5,
-                url = ?6,
-                notes_encrypted = ?7,
-                tags = ?8,
-                custom_fields_encrypted = ?9,
-                updated_at = ?10
-            WHERE id = ?1
-            "#,
-            params![
-                secret.id.to_string(),
-                secret.path,
-                secret.resource,
-                secret.login,
-                secret.password_encrypted,
-                secret.url,
-                secret.notes_encrypted,
-                tags,
-                secret.custom_fields_encrypted,
-                secret.updated_at
-            ],
-        );
-        let changed = map_sqlite_write_rows(changed, "secret")?;
-        if changed == 0 {
-            return Err(AppError::NotFound(format!(
-                "secret not found: {}",
-                secret.id
-            )));
-        }
-        Ok(())
+        self.run_write_tx("secret", move |tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE secrets SET
+                    path = ?2,
+                    resource = ?3,
+                    login = ?4,
+                    password_encrypted = ?5,
+                    url = ?6,
+                    notes_encrypted = ?7,
+                    tags = ?8,
+                    custom_fields_encrypted = ?9,
+                    updated_at = ?10
+                WHERE id = ?1
+                "#,
+                params![
+                    secret.id.to_string(),
+                    secret.path,
+                    secret.resource,
+                    secret.login,
+                    secret.password_encrypted,
+                    secret.url,
+                    secret.notes_encrypted,
+                    tags,
+                    secret.custom_fields_encrypted,
+                    secret.updated_at
+                ],
+            );
+            let changed = map_sqlite_write_rows(changed, "secret")?;
+            if changed == 0 {
+                return Err(AppError::NotFound(format!(
+                    "secret not found: {}",
+                    secret.id
+                )));
+            }
+            Ok(())
+        })
     }
 
     pub fn delete_secret(&self, id: Uuid) -> Result<(), AppError> {
-        let conn = self.open_conn()?;
-        let changed = conn.execute("DELETE FROM secrets WHERE id = ?1", [id.to_string()])?;
-        if changed == 0 {
-            return Err(AppError::NotFound(format!("secret not found: {id}")));
-        }
-        Ok(())
+        self.run_write_tx("secret", move |tx| {
+            let changed = tx.execute("DELETE FROM secrets WHERE id = ?1", [id.to_string()])?;
+            if changed == 0 {
+                return Err(AppError::NotFound(format!("secret not found: {id}")));
+            }
+            Ok(())
+        })
     }
 
     pub fn list_secrets(&self) -> Result<Vec<SecretRecord>, AppError> {
@@ -189,60 +230,62 @@ impl SqliteStorage {
     }
 
     pub fn insert_token(&self, token: &TokenRecord) -> Result<(), AppError> {
-        let conn = self.open_conn()?;
         let scopes = serde_json::to_string(&token.scopes)
             .map_err(|e| AppError::Serialization(format!("failed to serialize scopes: {e}")))?;
-        let result = conn.execute(
-            r#"
-            INSERT INTO tokens (
-                id, name, token_hash, scopes, created_at, expires_at, revoked_at, last_used_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            "#,
-            params![
-                token.id.to_string(),
-                token.name,
-                token.token_hash,
-                scopes,
-                token.created_at,
-                token.expires_at,
-                token.revoked_at,
-                token.last_used_at
-            ],
-        );
-        map_sqlite_write_result(result, "token")
+        self.run_write_tx("token", move |tx| {
+            let result = tx.execute(
+                r#"
+                INSERT INTO tokens (
+                    id, name, token_hash, scopes, created_at, expires_at, revoked_at, last_used_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    token.id.to_string(),
+                    token.name,
+                    token.token_hash,
+                    scopes,
+                    token.created_at,
+                    token.expires_at,
+                    token.revoked_at,
+                    token.last_used_at
+                ],
+            );
+            map_sqlite_write_result(result, "token")
+        })
     }
 
     pub fn update_token(&self, token: &TokenRecord) -> Result<(), AppError> {
-        let conn = self.open_conn()?;
         let scopes = serde_json::to_string(&token.scopes)
             .map_err(|e| AppError::Serialization(format!("failed to serialize scopes: {e}")))?;
-        let changed = conn.execute(
-            r#"
-            UPDATE tokens SET
-                name = ?2,
-                token_hash = ?3,
-                scopes = ?4,
-                expires_at = ?5,
-                revoked_at = ?6,
-                last_used_at = ?7
-            WHERE id = ?1
-            "#,
-            params![
-                token.id.to_string(),
-                token.name,
-                token.token_hash,
-                scopes,
-                token.expires_at,
-                token.revoked_at,
-                token.last_used_at
-            ],
-        );
-        let changed = map_sqlite_write_rows(changed, "token")?;
-        if changed == 0 {
-            return Err(AppError::NotFound(format!("token not found: {}", token.id)));
-        }
-        Ok(())
+        self.run_write_tx("token", move |tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE tokens SET
+                    name = ?2,
+                    token_hash = ?3,
+                    scopes = ?4,
+                    expires_at = ?5,
+                    revoked_at = ?6,
+                    last_used_at = ?7
+                WHERE id = ?1
+                "#,
+                params![
+                    token.id.to_string(),
+                    token.name,
+                    token.token_hash,
+                    scopes,
+                    token.expires_at,
+                    token.revoked_at,
+                    token.last_used_at
+                ],
+            );
+            let changed = map_sqlite_write_rows(changed, "token")?;
+            if changed == 0 {
+                return Err(AppError::NotFound(format!("token not found: {}", token.id)));
+            }
+            Ok(())
+        })
     }
 
     pub fn list_tokens(&self) -> Result<Vec<TokenRecord>, AppError> {
@@ -286,6 +329,58 @@ impl SqliteStorage {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    fn run_write_tx<T>(
+        &self,
+        _entity: &str,
+        op: impl FnOnce(&Transaction<'_>) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        if self.options.create_backup_before_write {
+            self.backup_database()?;
+        }
+        let mut conn = self.open_conn()?;
+        let tx = conn.transaction()?;
+        let result = op(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn backup_database(&self) -> Result<(), AppError> {
+        if !self.db_path.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.options.backup_dir)?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup_name = format!("secrets-{timestamp}-{}.db", Uuid::new_v4());
+        let backup_path = self.options.backup_dir.join(backup_name);
+        std::fs::copy(&self.db_path, &backup_path)?;
+        self.rotate_backups()
+    }
+
+    fn rotate_backups(&self) -> Result<(), AppError> {
+        let mut entries = std::fs::read_dir(&self.options.backup_dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
+        let keep = self.options.max_backups;
+        if entries.len() <= keep {
+            return Ok(());
+        }
+        let to_delete = entries.len() - keep;
+        for entry in entries.into_iter().take(to_delete) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+        Ok(())
     }
 
     fn open_conn(&self) -> Result<Connection, AppError> {

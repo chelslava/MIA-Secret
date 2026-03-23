@@ -3,10 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path as AxumPath, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -26,6 +28,9 @@ struct ApiState {
     cfg: Config,
     service: Arc<AppService>,
 }
+
+#[derive(Debug, Clone)]
+struct TraceId(String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HealthResponse {
@@ -49,7 +54,7 @@ struct ApiErrorBody {
 }
 
 pub async fn serve(cfg: Config) -> Result<(), AppError> {
-    let storage = Arc::new(SqliteStorage::new(&cfg.general.database_path)?);
+    let storage = Arc::new(SqliteStorage::from_config(&cfg)?);
     let crypto = CryptoService::from_config(&cfg)?;
     let service = Arc::new(AppService::new(storage, crypto));
     let state = ApiState {
@@ -57,9 +62,7 @@ pub async fn serve(cfg: Config) -> Result<(), AppError> {
         service,
     };
 
-    let addr = bind_addr(&cfg.server.host, cfg.server.port)?;
-    let app = Router::new()
-        .route("/api/v1/health", get(health))
+    let protected_routes = Router::new()
         .route("/api/v1/secrets", post(create_secret).get(list_secrets))
         .route(
             "/api/v1/secrets/{id}",
@@ -68,8 +71,22 @@ pub async fn serve(cfg: Config) -> Result<(), AppError> {
         .route("/api/v1/secrets/by-path/{*path}", get(get_secret_by_path))
         .route("/api/v1/tokens", post(create_token).get(list_tokens))
         .route("/api/v1/tokens/{id}/revoke", post(revoke_token))
-        .with_state(state);
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authz_middleware,
+        ));
 
+    let app = Router::new()
+        .route("/api/v1/health", get(health))
+        .merge(protected_routes)
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            timeout_middleware,
+        ))
+        .layer(middleware::from_fn(trace_id_middleware));
+
+    let addr = bind_addr(&cfg.server.host, cfg.server.port)?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
     axum::serve(listener, app.into_make_service())
@@ -103,153 +120,259 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
 
 async fn create_secret(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
     Json(req): Json<CreateSecretRequest>,
 ) -> Result<Json<Secret>, ApiHttpError> {
-    authorize(&state, &headers, "secrets.write")?;
     state
         .service
         .create_secret(req)
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
 async fn list_secrets(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
 ) -> Result<Json<Vec<Secret>>, ApiHttpError> {
-    authorize(&state, &headers, "secrets.list")?;
     state
         .service
         .list_secrets()
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
 async fn get_secret(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Secret>, ApiHttpError> {
-    authorize(&state, &headers, "secrets.read")?;
-    let id = parse_uuid(&id)?;
+    let id = Uuid::parse_str(&id).map_err(|_| {
+        ApiHttpError::from_app(
+            AppError::Validation(format!("invalid uuid: {id}")),
+            Some(trace.0.clone()),
+        )
+    })?;
     state
         .service
         .get_secret(id)
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
 async fn get_secret_by_path(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
     AxumPath(path): AxumPath<String>,
 ) -> Result<Json<Secret>, ApiHttpError> {
-    authorize(&state, &headers, "secrets.read")?;
     state
         .service
         .get_secret_by_path(path.trim_start_matches('/'))
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
 async fn update_secret(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
     AxumPath(id): AxumPath<String>,
     Json(req): Json<UpdateSecretRequest>,
 ) -> Result<Json<Secret>, ApiHttpError> {
-    authorize(&state, &headers, "secrets.write")?;
-    let id = parse_uuid(&id)?;
+    let id = Uuid::parse_str(&id).map_err(|_| {
+        ApiHttpError::from_app(
+            AppError::Validation(format!("invalid uuid: {id}")),
+            Some(trace.0.clone()),
+        )
+    })?;
     state
         .service
         .update_secret(id, req)
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
 async fn delete_secret(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiHttpError> {
-    authorize(&state, &headers, "secrets.delete")?;
-    let id = parse_uuid(&id)?;
-    state.service.delete_secret(id)?;
+    let id = Uuid::parse_str(&id).map_err(|_| {
+        ApiHttpError::from_app(
+            AppError::Validation(format!("invalid uuid: {id}")),
+            Some(trace.0.clone()),
+        )
+    })?;
+    state
+        .service
+        .delete_secret(id)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_token(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
     Json(req): Json<CreateTokenRequest>,
 ) -> Result<Json<TokenCreationResult>, ApiHttpError> {
-    if state.service.has_any_tokens()? {
-        authorize(&state, &headers, "tokens.manage")?;
-    }
     state
         .service
         .create_token(req)
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
 async fn list_tokens(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
 ) -> Result<Json<Vec<Token>>, ApiHttpError> {
-    authorize(&state, &headers, "tokens.manage")?;
     state
         .service
         .list_tokens()
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
 async fn revoke_token(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    Extension(trace): Extension<TraceId>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Token>, ApiHttpError> {
-    authorize(&state, &headers, "tokens.manage")?;
-    let id = parse_uuid(&id)?;
+    let id = Uuid::parse_str(&id).map_err(|_| {
+        ApiHttpError::from_app(
+            AppError::Validation(format!("invalid uuid: {id}")),
+            Some(trace.0.clone()),
+        )
+    })?;
     state
         .service
         .revoke_token(id)
         .map(Json)
-        .map_err(ApiHttpError::from)
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
 }
 
-fn authorize(state: &ApiState, headers: &HeaderMap, scope: &str) -> Result<(), ApiHttpError> {
-    let token = extract_bearer_token(headers)?;
-    state
-        .service
-        .authorize(token, scope)
-        .map(|_| ())
-        .map_err(ApiHttpError::from)
+async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
+    let trace_id = Uuid::new_v4().to_string();
+    req.extensions_mut().insert(TraceId(trace_id.clone()));
+    let mut response = next.run(req).await;
+    if let Ok(value) = HeaderValue::from_str(&trace_id) {
+        response.headers_mut().insert("x-trace-id", value);
+    }
+    response
 }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, ApiHttpError> {
-    let header = headers.get("Authorization").ok_or_else(|| {
-        ApiHttpError::from(AppError::Unauthorized("missing bearer token".to_owned()))
-    })?;
-    let value = header.to_str().map_err(|_| {
-        ApiHttpError::from(AppError::Unauthorized(
-            "invalid authorization header".to_owned(),
-        ))
-    })?;
-    let token = value
+async fn timeout_middleware(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiHttpError> {
+    let trace_id = extract_trace_id_from_request(&req);
+    match tokio::time::timeout(
+        Duration::from_secs(state.cfg.server.request_timeout_secs),
+        next.run(req),
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(_) => Err(ApiHttpError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code: "internal_error",
+            message: "request timeout exceeded".to_owned(),
+            trace_id,
+        }),
+    }
+}
+
+async fn authz_middleware(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiHttpError> {
+    let trace_id = extract_trace_id_from_request(&req);
+    if let Some(scope) = required_scope_for_request(&state, req.method(), req.uri().path())
+        .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?
+    {
+        let token = extract_bearer_token(req.headers(), &state.cfg.security.token_header)
+            .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?;
+        state
+            .service
+            .authorize(token, scope)
+            .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?;
+    }
+    Ok(next.run(req).await)
+}
+
+fn required_scope_for_request(
+    state: &ApiState,
+    method: &Method,
+    path: &str,
+) -> Result<Option<&'static str>, AppError> {
+    if method == Method::GET && path == "/api/v1/health" {
+        return Ok(None);
+    }
+
+    if path == "/api/v1/secrets" {
+        if method == Method::POST {
+            return Ok(Some("secrets.write"));
+        }
+        if method == Method::GET {
+            return Ok(Some("secrets.list"));
+        }
+    }
+
+    if method == Method::GET && path.starts_with("/api/v1/secrets/by-path/") {
+        return Ok(Some("secrets.read"));
+    }
+
+    if path.starts_with("/api/v1/secrets/") {
+        if method == Method::GET {
+            return Ok(Some("secrets.read"));
+        }
+        if method == Method::PATCH {
+            return Ok(Some("secrets.write"));
+        }
+        if method == Method::DELETE {
+            return Ok(Some("secrets.delete"));
+        }
+    }
+
+    if path == "/api/v1/tokens" {
+        if method == Method::POST {
+            if state.service.has_any_tokens()? {
+                return Ok(Some("tokens.manage"));
+            }
+            return Ok(None);
+        }
+        if method == Method::GET {
+            return Ok(Some("tokens.manage"));
+        }
+    }
+
+    if method == Method::POST && path.starts_with("/api/v1/tokens/") && path.ends_with("/revoke") {
+        return Ok(Some("tokens.manage"));
+    }
+
+    Ok(None)
+}
+
+fn extract_bearer_token<'a>(
+    headers: &'a HeaderMap,
+    header_name: &str,
+) -> Result<&'a str, AppError> {
+    let header = headers
+        .get(header_name)
+        .ok_or_else(|| AppError::Unauthorized("missing bearer token".to_owned()))?;
+    let value = header
+        .to_str()
+        .map_err(|_| AppError::Unauthorized("invalid authorization header".to_owned()))?;
+    value
         .strip_prefix("Bearer ")
         .or_else(|| value.strip_prefix("bearer "))
-        .ok_or_else(|| {
-            ApiHttpError::from(AppError::Unauthorized("expected Bearer token".to_owned()))
-        })?;
-    Ok(token)
+        .ok_or_else(|| AppError::Unauthorized("expected Bearer token".to_owned()))
 }
 
-fn parse_uuid(value: &str) -> Result<Uuid, ApiHttpError> {
-    Uuid::parse_str(value)
-        .map_err(|_| ApiHttpError::from(AppError::Validation(format!("invalid uuid: {value}"))))
+fn extract_trace_id_from_request(req: &Request) -> Option<String> {
+    req.extensions()
+        .get::<TraceId>()
+        .map(|trace| trace.0.clone())
 }
 
 fn bind_addr(host: &str, port: u16) -> Result<SocketAddr, AppError> {
@@ -284,70 +407,84 @@ struct ApiHttpError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    trace_id: Option<String>,
 }
 
-impl From<AppError> for ApiHttpError {
-    fn from(err: AppError) -> Self {
+impl ApiHttpError {
+    fn from_app(err: AppError, trace_id: Option<String>) -> Self {
         match err {
             AppError::Validation(message) => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "validation_error",
                 message,
+                trace_id,
             },
             AppError::NotFound(message) => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "not_found",
                 message,
+                trace_id,
             },
             AppError::Conflict(message) => Self {
                 status: StatusCode::CONFLICT,
                 code: "conflict",
                 message,
+                trace_id,
             },
             AppError::Unauthorized(message) => Self {
                 status: StatusCode::UNAUTHORIZED,
                 code: "unauthorized",
                 message,
+                trace_id,
             },
             AppError::Forbidden(message) => Self {
                 status: StatusCode::FORBIDDEN,
                 code: "forbidden",
                 message,
+                trace_id,
             },
             AppError::Crypto(message) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "crypto_error",
                 message,
+                trace_id,
             },
             AppError::Config(message) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "config_error",
                 message,
+                trace_id,
             },
             AppError::Storage(message) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "storage_error",
                 message,
+                trace_id,
             },
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
                 message: other.to_string(),
+                trace_id,
             },
         }
     }
 }
 
-impl axum::response::IntoResponse for ApiHttpError {
-    fn into_response(self) -> axum::response::Response {
-        let trace_id = Uuid::new_v4().to_string();
+impl IntoResponse for ApiHttpError {
+    fn into_response(self) -> Response {
+        let trace_id = self.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let body = Json(ErrorEnvelope {
             error: ApiErrorBody {
                 code: self.code.to_owned(),
                 message: self.message,
-                trace_id,
+                trace_id: trace_id.clone(),
             },
         });
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        if let Ok(value) = HeaderValue::from_str(&trace_id) {
+            response.headers_mut().insert("x-trace-id", value);
+        }
+        response
     }
 }

@@ -17,6 +17,7 @@ pub fn ensure_layout(cfg: &Config) -> Result<(), AppError> {
 
     let master_key_path = data_dir.join(MASTER_KEY_FILE_NAME);
     ensure_random_file(&master_key_path, MASTER_KEY_LEN)?;
+    secure_master_key_permissions(&master_key_path)?;
 
     Ok(())
 }
@@ -61,9 +62,41 @@ fn ensure_random_file(path: &Path, len: usize) -> Result<(), AppError> {
     let mut bytes = vec![0u8; len];
     fill_random_bytes(&mut bytes)?;
 
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?
+    };
+
+    #[cfg(not(unix))]
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(&bytes)?;
     file.flush()?;
+
+    Ok(())
+}
+
+fn secure_master_key_permissions(path: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(path, perms)?;
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = path;
+        tracing::warn!(
+            "master.key ACL hardening is best-effort on Windows in this build; prefer user-private data directory"
+        );
+    }
 
     Ok(())
 }
