@@ -54,7 +54,7 @@
 
 ### P1 — Укрепить Sprint B
 1. Контрактные тесты API (расширение)
-- [ ] Добавить контрактные проверки для дополнительных error-case веток `tokens`/`secrets` (особенно конфликты и edge-cases update/delete).
+- [x] Добавить контрактные проверки для дополнительных error-case веток `tokens`/`secrets` (особенно конфликты и edge-cases update/delete).
 - [ ] При необходимости вынести ожидания схем в snapshot-файлы для более прозрачного diff.
 
 2. CLI контракт ошибок
@@ -70,8 +70,7 @@
 - [x] Quickstart для бинарной поставки без `cargo run` (с примерами для Linux/Windows).
 
 ## Ближайшие коммиты (актуальный порядок)
-1. Расширение API contract tests по конфликтам и update/delete edge-cases.
-2. Snapshot-ожидания для API контрактов (если упростят review diff).
+1. Snapshot-ожидания для API контрактов (если упростят review diff).
 
 ## KPI (актуально)
 - Line coverage >= 75%: [x]

@@ -520,3 +520,122 @@ async fn contract_secret_and_token_payload_shape() {
 
     stop_server(shutdown_tx, handle).await;
 }
+
+#[tokio::test]
+async fn contract_secret_conflict_and_update_delete_edge_errors() {
+    let root = TestDir::new("secret-edge-errors");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "edge-admin",
+            "scopes": ["secrets.write", "secrets.read", "secrets.delete"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
+    let token_json: Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let created = client
+        .post(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "path": "apps/prod/edge",
+            "password": "secret-1"
+        }))
+        .send()
+        .await
+        .expect("create secret");
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+
+    let conflict = client
+        .post(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "path": "apps/prod/edge",
+            "password": "secret-2"
+        }))
+        .send()
+        .await
+        .expect("conflict create");
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    let conflict_json: Value = conflict.json().await.expect("conflict json");
+    assert_error_contract(&conflict_json, "conflict");
+
+    let missing_update = client
+        .patch(format!("{base_url}/api/v1/secrets/{}", Uuid::new_v4()))
+        .bearer_auth(&token)
+        .json(&json!({
+            "password": "new-password"
+        }))
+        .send()
+        .await
+        .expect("missing update");
+    assert_eq!(missing_update.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing_update_json: Value = missing_update.json().await.expect("update json");
+    assert_error_contract(&missing_update_json, "not_found");
+
+    let missing_delete = client
+        .delete(format!("{base_url}/api/v1/secrets/{}", Uuid::new_v4()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("missing delete");
+    assert_eq!(missing_delete.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing_delete_json: Value = missing_delete.json().await.expect("delete json");
+    assert_error_contract(&missing_delete_json, "not_found");
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test]
+async fn contract_token_revoke_edge_errors() {
+    let root = TestDir::new("token-revoke-edge-errors");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "token-admin",
+            "scopes": ["tokens.manage"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
+    let token_json: Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let invalid_uuid = client
+        .post(format!("{base_url}/api/v1/tokens/not-a-uuid/revoke"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("invalid uuid revoke");
+    assert_eq!(invalid_uuid.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_uuid_json: Value = invalid_uuid.json().await.expect("invalid uuid json");
+    assert_error_contract(&invalid_uuid_json, "validation_error");
+
+    let missing_revoke = client
+        .post(format!("{base_url}/api/v1/tokens/{}/revoke", Uuid::new_v4()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("missing revoke");
+    assert_eq!(missing_revoke.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing_revoke_json: Value = missing_revoke.json().await.expect("missing revoke json");
+    assert_error_contract(&missing_revoke_json, "not_found");
+
+    stop_server(shutdown_tx, handle).await;
+}
