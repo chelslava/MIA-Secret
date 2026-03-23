@@ -8,7 +8,7 @@
 - [x] Конфигурация TOML + ENV + CLI overrides с валидацией.
 - [x] Команды `config init/show/validate`.
 - [x] Команда `init`: создание `data-dir`, `secrets.db`, `master.key`.
-- [~] Миграции реализованы в коде (`execute_batch`), но отдельной папки `migrations/` пока нет.
+- [x] Миграции вынесены в отдельную папку `migrations/` и применяются через `schema_migrations`.
 
 ### Sprint 2: Crypto + Application use cases
 - [x] `CryptoService`: Argon2id + HKDF-SHA256 + AES-256-GCM.
@@ -20,8 +20,8 @@
 - [x] Axum API `/api/v1` для `health`, `secrets`, `tokens`.
 - [x] Единый формат ошибок API.
 - [x] CLI как клиент локального API (`add/get/list/update/delete`, `token ...`, `config ...`).
-- [~] Авторизация/проверка scopes работает, но реализована в handlers, а не через отдельный middleware слой.
-- [~] `traceId` генерируется в ответах, но полноценная трассировка запроса через middleware не завершена.
+- [x] Авторизация/проверка scopes вынесена в middleware.
+- [x] `traceId` и `x-trace-id` реализованы централизованно через middleware.
 
 ### Sprint 4: Hardening + Docs
 - [x] README + документация API/CLI.
@@ -38,7 +38,7 @@
 
 ### 2. Хранилище и транзакционность (высокий приоритет)
 1. [x] Ввести явные транзакции для операций записи (create/update/delete, revoke, last_used_at update).
-2. [ ] Вынести SQL-схему в отдельные миграции (`migrations/`) как артефакт поставки.
+2. [x] Вынести SQL-схему в отдельные миграции (`migrations/`) как артефакт поставки.
 3. [x] Реализовать политику backup из конфига (`create_backup_before_write`, `max_backups`).
 
 ### 3. API/CLI соответствие ТЗ (средний приоритет)
@@ -48,8 +48,8 @@
 
 ### 4. Тесты и качество (средний приоритет)
 1. [x] Добавить e2e-тесты API поверх HTTP (не только service/storage).
-2. [~] Добавить негативные security-тесты: истекший/отозванный токен, missing scope, loopback-only bind.
-3. Включить в CI `clippy -D warnings`, `fmt --check`, `test`.
+2. [~] Добавить негативные security-тесты: истекший/отозванный токен, missing scope, loopback-only bind (частично закрыто: revoked/missing scope).
+3. [x] Включить в CI `clippy -D warnings`, `fmt --check`, `test`.
 
 ### 5. Поставка (средний приоритет)
 1. Добавить инструкции по сборке для Windows/Linux в README.
