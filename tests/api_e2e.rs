@@ -580,3 +580,25 @@ async fn api_applies_rate_limit_to_protected_routes() {
 
     stop_server(shutdown_tx, handle).await;
 }
+
+#[tokio::test]
+async fn api_graceful_shutdown_stops_accepting_requests() {
+    let root = TestDir::new("graceful-shutdown");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let before = client
+        .get(format!("{base_url}/api/v1/health"))
+        .send()
+        .await
+        .expect("health before shutdown");
+    assert!(before.status().is_success());
+
+    stop_server(shutdown_tx, handle).await;
+
+    let after = client.get(format!("{base_url}/api/v1/health")).send().await;
+    assert!(after.is_err(), "server should stop accepting connections");
+}
