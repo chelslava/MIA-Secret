@@ -306,3 +306,168 @@ async fn api_expired_token_is_rejected() {
 
     stop_server(shutdown_tx, handle).await;
 }
+
+#[tokio::test]
+async fn api_secret_crud_and_token_routes_work_end_to_end() {
+    let root = TestDir::new("crud-and-token-routes");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let bootstrap_token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "crud-admin",
+            "scopes": [
+                "tokens.manage",
+                "secrets.write",
+                "secrets.read",
+                "secrets.list",
+                "secrets.delete"
+            ]
+        }))
+        .send()
+        .await
+        .expect("bootstrap token create");
+    assert!(bootstrap_token_resp.status().is_success());
+    let bootstrap_token_json: serde_json::Value = bootstrap_token_resp
+        .json()
+        .await
+        .expect("bootstrap token json");
+    let token = bootstrap_token_json["token"]
+        .as_str()
+        .expect("bootstrap token")
+        .to_owned();
+    let token_id = bootstrap_token_json["record"]["id"]
+        .as_str()
+        .expect("bootstrap token id")
+        .to_owned();
+
+    let created_resp = client
+        .post(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "path": "apps/prod",
+            "resource": "api",
+            "login": "svc-user",
+            "password": "secret-pass",
+            "url": "https://example.invalid",
+            "notes": "secret note",
+            "tags": ["prod", "api"]
+        }))
+        .send()
+        .await
+        .expect("create secret");
+    assert!(created_resp.status().is_success());
+    let created_json: serde_json::Value = created_resp.json().await.expect("created json");
+    let secret_id = created_json["id"].as_str().expect("secret id").to_owned();
+
+    let list_resp = client
+        .get(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list secrets");
+    assert!(list_resp.status().is_success());
+    let list_json: serde_json::Value = list_resp.json().await.expect("list json");
+    assert!(list_json.is_array());
+    assert_eq!(list_json.as_array().expect("array").len(), 1);
+
+    let get_by_id_resp = client
+        .get(format!("{base_url}/api/v1/secrets/{secret_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get secret by id");
+    assert!(get_by_id_resp.status().is_success());
+    let get_by_id_json: serde_json::Value = get_by_id_resp.json().await.expect("get by id json");
+    assert_eq!(get_by_id_json["path"], "apps/prod");
+
+    let get_by_path_resp = client
+        .get(format!("{base_url}/api/v1/secrets/by-path/apps%2Fprod"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get by path");
+    assert!(get_by_path_resp.status().is_success());
+    let get_by_path_json: serde_json::Value = get_by_path_resp.json().await.expect("by path json");
+    assert_eq!(get_by_path_json["id"], secret_id);
+
+    let update_resp = client
+        .patch(format!("{base_url}/api/v1/secrets/{secret_id}"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "path": "apps/prod-v2",
+            "password": "secret-pass-v2",
+            "notes": "updated note",
+            "tags": ["prod", "api-v2"]
+        }))
+        .send()
+        .await
+        .expect("update secret");
+    assert!(update_resp.status().is_success());
+    let update_json: serde_json::Value = update_resp.json().await.expect("update json");
+    assert_eq!(update_json["path"], "apps/prod-v2");
+
+    let invalid_uuid_resp = client
+        .get(format!("{base_url}/api/v1/secrets/not-a-uuid"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("invalid uuid request");
+    assert_eq!(invalid_uuid_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_uuid_json: serde_json::Value =
+        invalid_uuid_resp.json().await.expect("invalid uuid json");
+    assert_eq!(invalid_uuid_json["error"]["code"], "validation_error");
+
+    let list_tokens_resp = client
+        .get(format!("{base_url}/api/v1/tokens"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list tokens");
+    assert!(list_tokens_resp.status().is_success());
+    let list_tokens_json: serde_json::Value =
+        list_tokens_resp.json().await.expect("list tokens json");
+    assert!(list_tokens_json.is_array());
+    assert_eq!(list_tokens_json.as_array().expect("array").len(), 1);
+
+    let delete_resp = client
+        .delete(format!("{base_url}/api/v1/secrets/{secret_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete secret");
+    assert_eq!(delete_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let not_found_resp = client
+        .get(format!("{base_url}/api/v1/secrets/{secret_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get deleted secret");
+    assert_eq!(not_found_resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let revoke_self_resp = client
+        .post(format!("{base_url}/api/v1/tokens/{token_id}/revoke"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("revoke self");
+    assert!(revoke_self_resp.status().is_success());
+
+    let unauthorized_after_revoke = client
+        .get(format!("{base_url}/api/v1/tokens"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request after revoke");
+    assert_eq!(
+        unauthorized_after_revoke.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}

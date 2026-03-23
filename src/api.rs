@@ -615,3 +615,189 @@ impl IntoResponse for ApiHttpError {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootstrap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "mia-secret-api-test-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn test_config(root: &std::path::Path) -> Config {
+        let mut cfg = Config::default();
+        let data_dir = root.join("data");
+        let db_path = data_dir.join("secrets.db");
+        cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+        cfg.general.database_path = db_path.to_string_lossy().into_owned();
+        cfg.server.host = "127.0.0.1".to_owned();
+        cfg
+    }
+
+    fn make_state() -> ApiState {
+        let root = temp_dir("state");
+        let cfg = test_config(&root);
+        bootstrap::ensure_layout(&cfg).expect("ensure layout");
+        let storage = Arc::new(SqliteStorage::from_config(&cfg).expect("storage"));
+        let crypto = CryptoService::from_config(&cfg).expect("crypto");
+        let service = Arc::new(AppService::new(storage, crypto));
+        ApiState { cfg, service }
+    }
+
+    #[test]
+    fn required_scope_maps_routes_to_expected_permissions() {
+        let state = make_state();
+        assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/health").expect("health"),
+            None
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/config").expect("config"),
+            Some("config.read")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::POST, "/api/v1/secrets")
+                .expect("create secret"),
+            Some("secrets.write")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/secrets").expect("list"),
+            Some("secrets.list")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/secrets/by-path/a")
+                .expect("by path"),
+            Some("secrets.read")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::PATCH, "/api/v1/secrets/abc")
+                .expect("update"),
+            Some("secrets.write")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::DELETE, "/api/v1/secrets/abc")
+                .expect("delete"),
+            Some("secrets.delete")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::POST, "/api/v1/tokens")
+                .expect("bootstrap token"),
+            None
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/tokens").expect("list tok"),
+            Some("tokens.manage")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::POST, "/api/v1/tokens/x/revoke")
+                .expect("revoke"),
+            Some("tokens.manage")
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/unknown").expect("unknown"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_bearer_token_validates_header_format() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer token-123"),
+        );
+        assert_eq!(
+            extract_bearer_token(&headers, "Authorization").expect("token"),
+            "token-123"
+        );
+
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("bearer token-456"),
+        );
+        assert_eq!(
+            extract_bearer_token(&headers, "Authorization").expect("token lowercase"),
+            "token-456"
+        );
+
+        let missing = HeaderMap::new();
+        assert!(matches!(
+            extract_bearer_token(&missing, "Authorization"),
+            Err(AppError::Unauthorized(_))
+        ));
+
+        let mut invalid = HeaderMap::new();
+        invalid.insert("Authorization", HeaderValue::from_static("Token abc"));
+        assert!(matches!(
+            extract_bearer_token(&invalid, "Authorization"),
+            Err(AppError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn bind_addr_and_health_url_handle_localhost_ipv4_and_ipv6() {
+        let localhost = bind_addr("localhost", 8080).expect("localhost bind");
+        assert_eq!(
+            localhost,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
+        );
+
+        let ipv4 = bind_addr("127.0.0.1", 9090).expect("ipv4 bind");
+        assert_eq!(ipv4, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090));
+
+        let ipv6_url = health_url("::1", 3765).expect("ipv6 health");
+        assert_eq!(ipv6_url, "http://[::1]:3765/api/v1/health");
+
+        let localhost_url = health_url("localhost", 3765).expect("localhost health");
+        assert_eq!(localhost_url, "http://localhost:3765/api/v1/health");
+
+        assert!(matches!(
+            bind_addr("not-an-ip", 1),
+            Err(AppError::Address(_))
+        ));
+        assert!(matches!(
+            health_url("not-an-ip", 1),
+            Err(AppError::Address(_))
+        ));
+    }
+
+    #[test]
+    fn api_http_error_maps_and_sets_trace_id() {
+        let err = ApiHttpError::from_app(
+            AppError::Validation("bad request".to_owned()),
+            Some("trace-123".to_owned()),
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-trace-id")
+                .and_then(|h| h.to_str().ok()),
+            Some("trace-123")
+        );
+
+        let internal =
+            ApiHttpError::from_app(AppError::Io(std::io::Error::other("io failure")), None);
+        let response = internal.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response.headers().get("x-trace-id").is_some(),
+            "trace id must be generated"
+        );
+    }
+}

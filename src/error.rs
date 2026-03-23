@@ -47,3 +47,27 @@ impl From<rusqlite::Error> for AppError {
         Self::Storage(value.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+
+    #[test]
+    fn sqlite_error_converts_to_storage_error() {
+        let sqlite_err = rusqlite::Error::InvalidQuery;
+        let app_err: AppError = sqlite_err.into();
+        assert!(matches!(app_err, AppError::Storage(_)));
+    }
+
+    #[test]
+    fn display_messages_are_human_readable() {
+        let err = AppError::Config("bad config".to_owned());
+        assert_eq!(err.to_string(), "config error: bad config");
+
+        let err = AppError::Unauthorized("missing bearer token".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "authentication error: missing bearer token"
+        );
+    }
+}

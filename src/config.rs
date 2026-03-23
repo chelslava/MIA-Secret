@@ -303,3 +303,140 @@ fn validate_loopback_host(host: &str) -> Result<(), AppError> {
         "server.host must be a loopback address, got {host}"
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "mia-secret-config-test-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn validate_accepts_default_and_localhost() {
+        let mut cfg = Config::default();
+        cfg.server.host = "localhost".to_owned();
+        cfg.validate().expect("localhost should be accepted");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_values() {
+        let mut cfg = Config::default();
+        cfg.server.request_timeout_secs = 0;
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.security.lock_timeout_secs = 0;
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.crypto.argon2_memory_kb = MIN_ARGON2_MEMORY_KB - 1;
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.crypto.argon2_time_cost = MIN_ARGON2_TIME_COST - 1;
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.crypto.argon2_parallelism = MIN_ARGON2_PARALLELISM - 1;
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.general.data_dir = " ".to_owned();
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.general.database_path = " ".to_owned();
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn validate_rejects_non_loopback_host() {
+        let mut cfg = Config::default();
+        cfg.server.host = "192.168.1.10".to_owned();
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_explicit_path() {
+        let explicit = PathBuf::from("custom-config.toml");
+        let resolved = resolve_config_path(Some(explicit.clone()));
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn write_default_if_missing_and_force_behaviour() {
+        let root = temp_dir("write-default");
+        let path = root.join("config").join("mia-secret.toml");
+
+        write_default_if_missing(&path).expect("write missing default");
+        assert!(path.exists());
+        let first = fs::read_to_string(&path).expect("read created config");
+        assert!(first.contains("[general]"));
+
+        let err = write_default(&path, false).expect_err("should fail without force");
+        assert!(matches!(err, AppError::Config(message) if message.contains("already exists")));
+
+        write_default(&path, true).expect("force overwrite config");
+        let second = fs::read_to_string(&path).expect("read overwritten config");
+        assert!(!second.trim().is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_applies_cli_overrides() {
+        let root = temp_dir("load-overrides");
+        let path = root.join("mia-secret.toml");
+        fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 1111
+request_timeout_secs = 15
+
+[general]
+data_dir = "./data"
+database_path = "./data/secrets.db"
+"#,
+        )
+        .expect("write config file");
+
+        let cfg = load(
+            &path,
+            ConfigOverrides {
+                host: Some("localhost".to_owned()),
+                port: Some(4321),
+            },
+        )
+        .expect("load config with overrides");
+
+        assert_eq!(cfg.server.host, "localhost");
+        assert_eq!(cfg.server.port, 4321);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_missing_file_falls_back_to_defaults() {
+        let root = temp_dir("missing-file");
+        let path = root.join("does-not-exist.toml");
+        let cfg = load(&path, ConfigOverrides::default()).expect("load defaults");
+        assert_eq!(cfg.server.host, DEFAULT_HOST);
+        assert_eq!(cfg.server.port, DEFAULT_PORT);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+}

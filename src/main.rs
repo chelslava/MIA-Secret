@@ -328,9 +328,87 @@ fn map_api_error(status: reqwest::StatusCode, parsed: &serde_json::Value) -> App
 
 #[cfg(test)]
 mod tests {
-    use super::map_api_error;
+    use super::{ConfigCommands, load_command_config, map_api_error, request_json};
+    use crate::config::Config;
     use crate::error::AppError;
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "mia-secret-main-test-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    async fn spawn_test_server() -> (u16, oneshot::Sender<()>) {
+        async fn ok() -> Json<serde_json::Value> {
+            Json(json!({ "ok": true }))
+        }
+        async fn no_content() -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+        async fn structured_error() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": {
+                        "code": "forbidden",
+                        "message": "denied by policy"
+                    }
+                })),
+            )
+        }
+        async fn raw_error() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "password": "super-secret",
+                    "note": "visible"
+                })),
+            )
+        }
+        async fn echo_payload(Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(payload)
+        }
+
+        let app = Router::new()
+            .route("/ok", get(ok))
+            .route("/no-content", get(no_content))
+            .route("/err-structured", get(structured_error))
+            .route("/err-raw", get(raw_error))
+            .route("/echo", post(echo_payload));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        (port, shutdown_tx)
+    }
 
     #[test]
     fn maps_structured_api_error_to_typed_app_error() {
@@ -346,6 +424,68 @@ mod tests {
     }
 
     #[test]
+    fn maps_all_known_structured_error_codes() {
+        let cases = [
+            (
+                "validation_error",
+                reqwest::StatusCode::BAD_REQUEST,
+                "Validation",
+            ),
+            ("not_found", reqwest::StatusCode::NOT_FOUND, "NotFound"),
+            ("conflict", reqwest::StatusCode::CONFLICT, "Conflict"),
+            (
+                "unauthorized",
+                reqwest::StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+            ),
+            ("forbidden", reqwest::StatusCode::FORBIDDEN, "Forbidden"),
+            (
+                "crypto_error",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "Crypto",
+            ),
+            (
+                "config_error",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "Config",
+            ),
+            (
+                "storage_error",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage",
+            ),
+            (
+                "unknown_code",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "Server",
+            ),
+        ];
+
+        for (code, status, expected_kind) in cases {
+            let input = json!({
+                "error": {
+                    "code": code,
+                    "message": format!("message for {code}")
+                }
+            });
+            let err = map_api_error(status, &input);
+            let got = match err {
+                AppError::Validation(_) => "Validation",
+                AppError::NotFound(_) => "NotFound",
+                AppError::Conflict(_) => "Conflict",
+                AppError::Unauthorized(_) => "Unauthorized",
+                AppError::Forbidden(_) => "Forbidden",
+                AppError::Crypto(_) => "Crypto",
+                AppError::Config(_) => "Config",
+                AppError::Storage(_) => "Storage",
+                AppError::Server(_) => "Server",
+                _ => "Other",
+            };
+            assert_eq!(got, expected_kind, "unexpected mapping for code={code}");
+        }
+    }
+
+    #[test]
     fn redacts_unstructured_api_error_payload() {
         let input = json!({
             "raw": {
@@ -357,5 +497,96 @@ mod tests {
         let text = err.to_string();
         assert!(!text.contains("secret"));
         assert!(text.contains("***REDACTED***"));
+    }
+
+    #[tokio::test]
+    async fn request_json_handles_success_no_content_and_errors() {
+        let (port, shutdown_tx) = spawn_test_server().await;
+
+        let mut cfg = Config::default();
+        cfg.server.host = "localhost".to_owned();
+        cfg.server.port = port;
+        cfg.server.request_timeout_secs = 5;
+
+        let ok = request_json(&cfg, reqwest::Method::GET, "/ok", None::<serde_json::Value>)
+            .await
+            .expect("ok response");
+        assert_eq!(ok["ok"], true);
+
+        let echoed = request_json(
+            &cfg,
+            reqwest::Method::POST,
+            "/echo",
+            Some(json!({ "name": "mia" })),
+        )
+        .await
+        .expect("echo response");
+        assert_eq!(echoed["name"], "mia");
+
+        let no_content = request_json(
+            &cfg,
+            reqwest::Method::GET,
+            "/no-content",
+            None::<serde_json::Value>,
+        )
+        .await
+        .expect("no content response");
+        assert_eq!(no_content["status"], "ok");
+
+        let structured_err = request_json(
+            &cfg,
+            reqwest::Method::GET,
+            "/err-structured",
+            None::<serde_json::Value>,
+        )
+        .await
+        .expect_err("expected structured error");
+        assert!(matches!(structured_err, AppError::Forbidden(_)));
+
+        let raw_err = request_json(
+            &cfg,
+            reqwest::Method::GET,
+            "/err-raw",
+            None::<serde_json::Value>,
+        )
+        .await
+        .expect_err("expected raw error");
+        let text = raw_err.to_string();
+        assert!(!text.contains("super-secret"));
+        assert!(text.contains("***REDACTED***"));
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn load_command_config_applies_port_override() {
+        let root = temp_dir("load-config");
+        let path = root.join("mia-secret.toml");
+        fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3765
+request_timeout_secs = 20
+"#,
+        )
+        .expect("write config");
+
+        let cfg = load_command_config(Some(path.clone()), Some(4000)).expect("load config");
+        assert_eq!(cfg.server.port, 4000);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn config_init_refuses_overwrite_without_force() {
+        let root = temp_dir("config-init");
+        let path = root.join("mia-secret.toml");
+        fs::write(&path, "existing = true").expect("write existing file");
+        let err = super::handle_config_command(Some(path), ConfigCommands::Init { force: false })
+            .expect_err("expected config already exists error");
+        assert!(matches!(err, AppError::Config(message) if message.contains("already exists")));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }
