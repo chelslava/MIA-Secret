@@ -37,8 +37,13 @@ fn bin_path() -> &'static str {
 }
 
 fn run_cli(cwd: &Path, args: &[&str]) -> std::process::Output {
+    run_cli_with_env(cwd, args, &[])
+}
+
+fn run_cli_with_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     Command::new(bin_path())
         .current_dir(cwd)
+        .envs(envs.iter().copied())
         .args(args)
         .output()
         .expect("failed to run cli")
@@ -375,6 +380,127 @@ async fn cli_list_without_token_returns_auth_exit_code() {
         stderr_text(&list).contains("authentication error"),
         "unexpected stderr: {}",
         stderr_text(&list)
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_get_missing_secret_returns_not_found_exit_code() {
+    let root = TestDir::new("cli-get-missing");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&serde_json::json!({
+            "name": "reader",
+            "scopes": ["secrets.read"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert!(token_resp.status().is_success());
+    let token_json: serde_json::Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let get = run_cli_with_env(
+        root.path(),
+        &["--config", &config_arg, "get", "missing/secret/path"],
+        &[("MIA_SECRET_TOKEN", token.as_str())],
+    );
+    assert!(!get.status.success(), "get should fail for missing path");
+    assert_eq!(
+        get.status.code(),
+        Some(4),
+        "not found should map to exit code 4, stderr={}",
+        stderr_text(&get)
+    );
+    assert!(
+        stderr_text(&get).contains("not found"),
+        "unexpected stderr: {}",
+        stderr_text(&get)
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_token_revoke_invalid_uuid_returns_validation_exit_code() {
+    let root = TestDir::new("cli-token-revoke-invalid");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&serde_json::json!({
+            "name": "admin",
+            "scopes": ["tokens.manage"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert!(token_resp.status().is_success());
+    let token_json: serde_json::Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let revoke = run_cli_with_env(
+        root.path(),
+        &["--config", &config_arg, "token", "revoke", "not-a-uuid"],
+        &[("MIA_SECRET_TOKEN", token.as_str())],
+    );
+    assert!(
+        !revoke.status.success(),
+        "revoke should fail for invalid uuid"
+    );
+    assert_eq!(
+        revoke.status.code(),
+        Some(2),
+        "validation should map to exit code 2, stderr={}",
+        stderr_text(&revoke)
+    );
+    assert!(
+        stderr_text(&revoke).contains("invalid uuid"),
+        "unexpected stderr: {}",
+        stderr_text(&revoke)
     );
 
     stop_server(shutdown_tx, handle).await;

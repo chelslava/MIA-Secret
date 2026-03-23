@@ -267,6 +267,10 @@ struct ImportSummary {
     failed: usize,
 }
 
+const MAX_IMPORT_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_IMPORT_ROWS: usize = 50_000;
+const MAX_IMPORT_FIELD_LENGTH: usize = 8_192;
+
 fn handle_import_command(path: Option<PathBuf>, command: ImportCommands) -> Result<(), AppError> {
     match command {
         ImportCommands::Csv {
@@ -378,6 +382,8 @@ fn parse_import_csv(
     file: &std::path::Path,
     source: ImportSource,
 ) -> Result<Vec<ImportSecretRow>, AppError> {
+    validate_import_file(file)?;
+
     let mut reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .from_path(file)
@@ -392,13 +398,26 @@ fn parse_import_csv(
         .collect::<Vec<_>>();
 
     let mut rows = Vec::new();
-    for record in reader.records() {
+    for (row_index, record) in reader.records().enumerate() {
+        if row_index >= MAX_IMPORT_ROWS {
+            return Err(AppError::Validation(format!(
+                "CSV import exceeds maximum rows limit ({MAX_IMPORT_ROWS})"
+            )));
+        }
+
         let record = record
             .map_err(|err| AppError::Validation(format!("unable to read CSV record: {err}")))?;
         let mut row = HashMap::<String, String>::new();
         for (index, value) in record.iter().enumerate() {
             if let Some(header) = headers.get(index) {
-                row.insert(header.clone(), value.trim().to_owned());
+                let trimmed = value.trim();
+                if trimmed.chars().count() > MAX_IMPORT_FIELD_LENGTH {
+                    return Err(AppError::Validation(format!(
+                        "CSV field '{}' exceeds maximum length ({MAX_IMPORT_FIELD_LENGTH} characters)",
+                        header
+                    )));
+                }
+                row.insert(header.clone(), trimmed.to_owned());
             }
         }
         if let Some(parsed) = parse_import_row(&row, source.clone())? {
@@ -429,6 +448,7 @@ fn parse_generic_row(row: &HashMap<String, String>) -> Result<Option<ImportSecre
             "generic CSV row requires non-empty path and password".to_owned(),
         ));
     }
+    validate_import_path(path)?;
     let tags = get_csv_value(row, "tags")
         .split(',')
         .map(str::trim)
@@ -464,6 +484,7 @@ fn parse_bitwarden_row(row: &HashMap<String, String>) -> Result<Option<ImportSec
     } else {
         format!("{folder}/{name}")
     };
+    validate_import_path(&path)?;
 
     let mut notes = optional_csv_value(row, "notes");
     if let Some(totp) = optional_csv_value(row, "login_totp") {
@@ -501,6 +522,34 @@ fn optional_csv_value(row: &HashMap<String, String>, key: &str) -> Option<String
     } else {
         Some(value.to_owned())
     }
+}
+
+fn validate_import_file(file: &std::path::Path) -> Result<(), AppError> {
+    let metadata = std::fs::metadata(file).map_err(|err| {
+        AppError::Validation(format!("unable to access CSV {}: {err}", file.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(AppError::Validation(format!(
+            "CSV import path is not a file: {}",
+            file.display()
+        )));
+    }
+    if metadata.len() > MAX_IMPORT_FILE_SIZE_BYTES {
+        return Err(AppError::Validation(format!(
+            "CSV import file exceeds maximum size ({} bytes)",
+            MAX_IMPORT_FILE_SIZE_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn validate_import_path(path: &str) -> Result<(), AppError> {
+    if path.chars().any(char::is_control) {
+        return Err(AppError::Validation(
+            "path contains forbidden control characters".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn call_local_api<T: Serialize>(
@@ -609,8 +658,9 @@ fn exit_code_for_error(err: &AppError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigCommands, exit_code_for_error, load_command_config, map_api_error,
-        parse_bitwarden_row, parse_generic_row, request_json,
+        ConfigCommands, MAX_IMPORT_FIELD_LENGTH, MAX_IMPORT_FILE_SIZE_BYTES, exit_code_for_error,
+        MAX_IMPORT_ROWS, load_command_config, map_api_error, parse_bitwarden_row,
+        parse_generic_row, parse_import_csv, request_json, validate_import_file,
     };
     use crate::config::Config;
     use crate::error::AppError;
@@ -959,5 +1009,80 @@ request_timeout_secs = 20
                 .as_deref()
                 .is_some_and(|value| value.contains("TOTP:"))
         );
+    }
+
+    #[test]
+    fn parse_generic_row_rejects_control_characters_in_path() {
+        let mut row = HashMap::new();
+        row.insert("path".to_owned(), "apps/\nprod/db".to_owned());
+        row.insert("password".to_owned(), "secret".to_owned());
+
+        let err = parse_generic_row(&row).expect_err("must fail for control char in path");
+        assert!(
+            matches!(err, AppError::Validation(message) if message.contains("control characters"))
+        );
+    }
+
+    #[test]
+    fn parse_bitwarden_row_rejects_control_characters_in_generated_path() {
+        let mut row = HashMap::new();
+        row.insert("folder".to_owned(), "prod".to_owned());
+        row.insert("name".to_owned(), "db\tmain".to_owned());
+        row.insert("login_password".to_owned(), "secret".to_owned());
+
+        let err = parse_bitwarden_row(&row).expect_err("must fail for control char in path");
+        assert!(
+            matches!(err, AppError::Validation(message) if message.contains("control characters"))
+        );
+    }
+
+    #[test]
+    fn parse_import_csv_rejects_too_long_field() {
+        let root = temp_dir("import-long-field");
+        let csv_path = root.join("long.csv");
+        let long_value = "a".repeat(MAX_IMPORT_FIELD_LENGTH + 1);
+        fs::write(
+            &csv_path,
+            format!("path,password\napps/prod/db,{long_value}\n"),
+        )
+        .expect("write csv");
+
+        let err = parse_import_csv(&csv_path, super::ImportSource::Generic)
+            .expect_err("must fail for oversized field");
+        assert!(
+            matches!(err, AppError::Validation(message) if message.contains("exceeds maximum length"))
+        );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validate_import_file_rejects_too_large_file() {
+        let root = temp_dir("import-size-limit");
+        let csv_path = root.join("large.csv");
+        fs::write(
+            &csv_path,
+            vec![b'a'; (MAX_IMPORT_FILE_SIZE_BYTES as usize) + 1],
+        )
+        .expect("write large csv");
+
+        let err = validate_import_file(&csv_path).expect_err("must fail for large file");
+        assert!(matches!(err, AppError::Validation(message) if message.contains("maximum size")));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parse_import_csv_rejects_too_many_rows() {
+        let root = temp_dir("import-row-limit");
+        let csv_path = root.join("rows.csv");
+        let mut content = String::from("path,password\n");
+        for idx in 0..=MAX_IMPORT_ROWS {
+            content.push_str(&format!("apps/prod/{idx},secret\n"));
+        }
+        fs::write(&csv_path, content).expect("write csv");
+
+        let err = parse_import_csv(&csv_path, super::ImportSource::Generic)
+            .expect_err("must fail for too many rows");
+        assert!(matches!(err, AppError::Validation(message) if message.contains("maximum rows limit")));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }
