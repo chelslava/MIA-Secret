@@ -279,7 +279,8 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
   "server": {
     "host": "127.0.0.1",
     "port": 3765,
-    "request_timeout_secs": 30
+    "request_timeout_secs": 30,
+    "max_request_body_kb": 64
   }
 }
 ```
@@ -311,3 +312,4 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
 * `trace-id`: на каждый запрос генерируется `traceId`, возвращается в error body и заголовке `x-trace-id`.
 * `authz`: централизованная проверка Bearer-токена и требуемого scope по маршруту.
 * `timeout`: ограничение времени обработки запроса согласно `server.request_timeout_secs`.
+* `body-limit`: ограничение размера request body согласно `server.max_request_body_kb` (ответ `413 Payload Too Large` при превышении).

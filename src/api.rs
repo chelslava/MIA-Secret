@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -79,6 +79,7 @@ struct SafeServerConfig {
     host: String,
     port: u16,
     request_timeout_secs: u64,
+    max_request_body_kb: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +165,7 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
         .route("/api/v1/ready", get(readiness))
         .merge(protected_routes)
         .with_state(state.clone())
+        .layer(DefaultBodyLimit::max(max_request_body_bytes(&cfg)))
         .layer(middleware::from_fn(access_log_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -235,6 +237,13 @@ fn compute_readiness_checks(cfg: &Config) -> ReadinessChecks {
     }
 }
 
+fn max_request_body_bytes(cfg: &Config) -> usize {
+    cfg.server
+        .max_request_body_kb
+        .saturating_mul(1024)
+        .min(usize::MAX as u64) as usize
+}
+
 fn open_database_readonly(path: &Path) -> Result<rusqlite::Connection, AppError> {
     rusqlite::Connection::open_with_flags(
         path,
@@ -267,6 +276,7 @@ async fn read_config(
             host: cfg.server.host.clone(),
             port: cfg.server.port,
             request_timeout_secs: cfg.server.request_timeout_secs,
+            max_request_body_kb: cfg.server.max_request_body_kb,
         },
         security: SafeSecurityConfig {
             token_header: cfg.security.token_header.clone(),
@@ -877,6 +887,13 @@ mod tests {
             response.headers().get("x-trace-id").is_some(),
             "trace id must be generated"
         );
+    }
+
+    #[test]
+    fn max_request_body_bytes_converts_kb_to_bytes() {
+        let mut cfg = Config::default();
+        cfg.server.max_request_body_kb = 1;
+        assert_eq!(max_request_body_bytes(&cfg), 1024);
     }
 
     #[test]

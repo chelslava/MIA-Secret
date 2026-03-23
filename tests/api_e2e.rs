@@ -482,3 +482,47 @@ async fn api_secret_crud_and_token_routes_work_end_to_end() {
 
     stop_server(shutdown_tx, handle).await;
 }
+
+#[tokio::test]
+async fn api_rejects_payload_larger_than_configured_limit() {
+    let root = TestDir::new("payload-limit");
+    let mut cfg = test_config(root.path());
+    cfg.server.max_request_body_kb = 1;
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "limit-admin",
+            "scopes": ["secrets.write"]
+        }))
+        .send()
+        .await
+        .expect("create token");
+    assert!(token_resp.status().is_success());
+    let token_json: serde_json::Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let oversized_notes = "x".repeat(8 * 1024);
+    let oversized_resp = client
+        .post(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "path": "oversized/payload",
+            "password": "small-password",
+            "notes": oversized_notes
+        }))
+        .send()
+        .await
+        .expect("oversized request");
+
+    assert_eq!(
+        oversized_resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
