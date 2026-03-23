@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use mia_secret::api;
 use mia_secret::bootstrap;
 use mia_secret::config::Config;
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -323,6 +324,42 @@ async fn contract_rate_limited_error_shape() {
     assert_eq!(second.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     let second_json: Value = second.json().await.expect("rate limited json");
     assert_error_contract(&second_json, "rate_limited");
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test]
+async fn contract_readiness_not_ready_when_schema_migrations_missing() {
+    let root = TestDir::new("readiness-schema-missing");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let conn = Connection::open(&cfg.general.database_path).expect("open sqlite");
+    conn.execute("DROP TABLE IF EXISTS schema_migrations", [])
+        .expect("drop schema_migrations");
+
+    let ready = client
+        .get(format!("{base_url}/api/v1/ready"))
+        .send()
+        .await
+        .expect("ready request");
+    assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+    let ready_json: Value = ready.json().await.expect("ready json");
+    assert_eq!(ready_json.get("status"), Some(&json!("not_ready")));
+    let checks = ready_json.get("checks").expect("checks");
+    assert_eq!(
+        checks.get("database_connection"),
+        Some(&Value::Bool(true)),
+        "db must still be reachable"
+    );
+    assert_eq!(
+        checks.get("schema_migrations_present"),
+        Some(&Value::Bool(false)),
+        "schema_migrations check must fail"
+    );
 
     stop_server(shutdown_tx, handle).await;
 }
