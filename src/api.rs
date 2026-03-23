@@ -10,6 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -39,6 +40,20 @@ struct HealthResponse {
     version: String,
     database_ready: bool,
     config_loaded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReadinessResponse {
+    status: String,
+    version: String,
+    checks: ReadinessChecks,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReadinessChecks {
+    config_loaded: bool,
+    database_connection: bool,
+    schema_migrations_present: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +161,7 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
 
     let app = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/ready", get(readiness))
         .merge(protected_routes)
         .with_state(state.clone())
         .layer(middleware::from_fn(access_log_middleware))
@@ -179,6 +195,61 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
         database_ready: Path::new(&state.cfg.general.database_path).exists(),
         config_loaded: true,
     })
+}
+
+async fn readiness(State(state): State<ApiState>) -> (StatusCode, Json<ReadinessResponse>) {
+    let checks = compute_readiness_checks(&state.cfg);
+    let is_ready =
+        checks.config_loaded && checks.database_connection && checks.schema_migrations_present;
+    let status = if is_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = ReadinessResponse {
+        status: if is_ready {
+            "ready".to_owned()
+        } else {
+            "not_ready".to_owned()
+        },
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        checks,
+    };
+    (status, Json(body))
+}
+
+fn compute_readiness_checks(cfg: &Config) -> ReadinessChecks {
+    let db_path = Path::new(&cfg.general.database_path);
+    let (database_connection, schema_migrations_present) = match open_database_readonly(db_path) {
+        Ok(conn) => {
+            let schema_ok = schema_migrations_table_exists(&conn).unwrap_or(false);
+            (true, schema_ok)
+        }
+        Err(_) => (false, false),
+    };
+
+    ReadinessChecks {
+        config_loaded: true,
+        database_connection,
+        schema_migrations_present,
+    }
+}
+
+fn open_database_readonly(path: &Path) -> Result<rusqlite::Connection, AppError> {
+    rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(Into::into)
+}
+
+fn schema_migrations_table_exists(conn: &rusqlite::Connection) -> Result<bool, AppError> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists > 0)
 }
 
 async fn read_config(
@@ -432,6 +503,9 @@ fn required_scope_for_request(
     if method == Method::GET && path == "/api/v1/health" {
         return Ok(None);
     }
+    if method == Method::GET && path == "/api/v1/ready" {
+        return Ok(None);
+    }
     if method == Method::GET && path == "/api/v1/config" {
         return Ok(Some("config.read"));
     }
@@ -666,6 +740,10 @@ mod tests {
             None
         );
         assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/ready").expect("ready"),
+            None
+        );
+        assert_eq!(
             required_scope_for_request(&state, &Method::GET, "/api/v1/config").expect("config"),
             Some("config.read")
         );
@@ -799,5 +877,27 @@ mod tests {
             response.headers().get("x-trace-id").is_some(),
             "trace id must be generated"
         );
+    }
+
+    #[test]
+    fn readiness_checks_report_not_ready_when_database_is_missing() {
+        let root = temp_dir("readiness-missing-db");
+        let cfg = test_config(&root);
+        let checks = compute_readiness_checks(&cfg);
+        assert!(checks.config_loaded);
+        assert!(!checks.database_connection);
+        assert!(!checks.schema_migrations_present);
+    }
+
+    #[test]
+    fn readiness_checks_report_ready_for_initialized_layout() {
+        let root = temp_dir("readiness-ready");
+        let cfg = test_config(&root);
+        bootstrap::ensure_layout(&cfg).expect("ensure layout");
+        let _storage = SqliteStorage::from_config(&cfg).expect("initialize storage and migrations");
+        let checks = compute_readiness_checks(&cfg);
+        assert!(checks.config_loaded);
+        assert!(checks.database_connection);
+        assert!(checks.schema_migrations_present);
     }
 }

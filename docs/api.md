@@ -54,6 +54,33 @@ Authorization: Bearer <token>
 }
 ```
 
+## Readiness
+
+`GET /api/v1/ready`
+
+Проверяет реальную готовность сервиса к обработке запросов:
+- доступность SQLite в read-only режиме;
+- наличие таблицы миграций `schema_migrations`;
+- факт загрузки конфигурации.
+
+Возвращает:
+- `200 OK`, если сервис готов (`status = "ready"`);
+- `503 Service Unavailable`, если хотя бы одна проверка провалена (`status = "not_ready"`).
+
+Пример ответа:
+
+```json
+{
+  "status": "ready",
+  "version": "0.1.0",
+  "checks": {
+    "config_loaded": true,
+    "database_connection": true,
+    "schema_migrations_present": true
+  }
+}
+```
+
 ## Секреты
 
 ### Создать секрет

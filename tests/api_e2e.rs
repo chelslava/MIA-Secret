@@ -93,6 +93,17 @@ async fn api_health_and_authz_middleware_behaviour() {
         "x-trace-id header must exist"
     );
 
+    let ready = client
+        .get(format!("{base_url}/api/v1/ready"))
+        .send()
+        .await
+        .expect("ready request");
+    assert!(ready.status().is_success());
+    let ready_body: serde_json::Value = ready.json().await.expect("ready body");
+    assert_eq!(ready_body["status"], "ready");
+    assert_eq!(ready_body["checks"]["database_connection"], true);
+    assert_eq!(ready_body["checks"]["schema_migrations_present"], true);
+
     let unauthorized = client
         .get(format!("{base_url}/api/v1/secrets"))
         .send()
