@@ -228,10 +228,7 @@ async fn contract_negative_error_shapes_for_common_failures() {
         .expect("admin token create");
     assert_eq!(admin_resp.status(), reqwest::StatusCode::OK);
     let admin_json: Value = admin_resp.json().await.expect("admin token json");
-    let admin_token = admin_json["token"]
-        .as_str()
-        .expect("token")
-        .to_owned();
+    let admin_token = admin_json["token"].as_str().expect("token").to_owned();
 
     let limited_resp = client
         .post(format!("{base_url}/api/v1/tokens"))

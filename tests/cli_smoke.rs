@@ -2,6 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use mia_secret::api;
+use mia_secret::bootstrap;
+use mia_secret::config::Config;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 struct TestDir {
@@ -36,6 +42,90 @@ fn run_cli(cwd: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("failed to run cli")
+}
+
+async fn start_server(cfg: &Config) -> (String, oneshot::Sender<()>, JoinHandle<()>) {
+    let app = api::build_app(cfg.clone()).expect("build app");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral listener");
+    let addr = listener.local_addr().expect("local addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    (format!("http://{addr}"), shutdown_tx, handle)
+}
+
+async fn stop_server(tx: oneshot::Sender<()>, handle: JoinHandle<()>) {
+    let _ = tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+}
+
+async fn wait_until_healthy(base_url: &str) {
+    let client = reqwest::Client::new();
+    for _ in 0..40 {
+        if let Ok(resp) = client.get(format!("{base_url}/api/v1/health")).send().await
+            && resp.status().is_success()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("server did not become healthy in time: {base_url}");
+}
+
+fn write_config(path: &Path, port: u16) {
+    let parent = path.parent().expect("config parent");
+    let data_dir = parent.join("data");
+    let db_path = data_dir.join("secrets.db");
+    let rendered = format!(
+        r#"[general]
+data_dir = "{}"
+database_path = "{}"
+log_level = "info"
+enable_file_logging = true
+
+[server]
+host = "127.0.0.1"
+port = {port}
+request_timeout_secs = 10
+max_request_body_kb = 64
+protected_rate_limit_rps = 30
+
+[security]
+token_header = "Authorization"
+lock_timeout_secs = 300
+max_failed_attempts = 5
+min_master_password_length = 12
+
+[crypto]
+argon2_memory_kb = 65536
+argon2_time_cost = 3
+argon2_parallelism = 4
+encrypt_notes = true
+encrypt_custom_fields = true
+
+[storage]
+auto_migrate = true
+create_backup_before_write = true
+max_backups = 10
+sqlite_busy_timeout_ms = 5000
+
+[cli]
+output_format = "table"
+interactive = true
+"#,
+        data_dir.to_string_lossy().replace('\\', "/"),
+        db_path.to_string_lossy().replace('\\', "/"),
+    );
+    fs::write(path, rendered).expect("write config");
 }
 
 fn stdout_text(output: &std::process::Output) -> String {
@@ -114,6 +204,11 @@ fn cli_config_init_without_force_fails_on_existing_file() {
         "second init should fail, stdout={}",
         stdout_text(&second)
     );
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "config conflict should map to exit code 2"
+    );
     assert!(
         stderr_text(&second).contains("config already exists"),
         "unexpected stderr: {}",
@@ -134,6 +229,11 @@ fn cli_serve_rejects_non_loopback_host_override() {
     assert!(
         !output.status.success(),
         "serve should fail for non-loopback host"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "validation should map to exit code 2"
     );
     let err = stderr_text(&output);
     assert!(
@@ -172,4 +272,66 @@ fn cli_init_creates_data_layout() {
         root.path().join("data").join("secrets.db").exists(),
         "database must exist"
     );
+}
+
+#[test]
+fn cli_list_without_server_returns_operational_exit_code() {
+    let root = TestDir::new("list-no-server");
+    let config_path = root.path().join("mia-secret.toml");
+    write_config(&config_path, 37771);
+    let config_arg = config_path.to_string_lossy().into_owned();
+
+    let list = run_cli(root.path(), &["--config", &config_arg, "list"]);
+    assert!(!list.status.success(), "list should fail without server");
+    assert_eq!(
+        list.status.code(),
+        Some(6),
+        "http connectivity errors should map to exit code 6"
+    );
+    assert!(
+        stderr_text(&list).contains("HTTP client error"),
+        "unexpected stderr: {}",
+        stderr_text(&list)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_list_without_token_returns_auth_exit_code() {
+    let root = TestDir::new("list-unauthorized");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+    let config_arg = config_path.to_string_lossy().into_owned();
+
+    let list = run_cli(root.path(), &["--config", &config_arg, "list"]);
+    assert!(!list.status.success(), "list should fail without token");
+    assert_eq!(
+        list.status.code(),
+        Some(3),
+        "auth failures should map to exit code 3, stderr={}",
+        stderr_text(&list)
+    );
+    assert!(
+        stderr_text(&list).contains("authentication error"),
+        "unexpected stderr: {}",
+        stderr_text(&list)
+    );
+
+    stop_server(shutdown_tx, handle).await;
 }

@@ -19,11 +19,14 @@ use serde::{Deserialize, Serialize};
 use storage::SqliteStorage;
 
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
+async fn main() {
     init_tracing();
 
     let cli = Cli::parse();
-    dispatch(cli).await
+    if let Err(err) = dispatch(cli).await {
+        eprintln!("{err}");
+        std::process::exit(exit_code_for_error(&err));
+    }
 }
 
 fn init_tracing() {
@@ -326,9 +329,26 @@ fn map_api_error(status: reqwest::StatusCode, parsed: &serde_json::Value) -> App
     AppError::Server(format!("api error {status}: {safe}"))
 }
 
+fn exit_code_for_error(err: &AppError) -> i32 {
+    match err {
+        AppError::Validation(_) | AppError::Config(_) | AppError::Address(_) => 2,
+        AppError::Unauthorized(_) | AppError::Forbidden(_) => 3,
+        AppError::NotFound(_) => 4,
+        AppError::Conflict(_) => 5,
+        AppError::Http(_)
+        | AppError::Io(_)
+        | AppError::Storage(_)
+        | AppError::Crypto(_)
+        | AppError::Serialization(_)
+        | AppError::Server(_) => 6,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ConfigCommands, load_command_config, map_api_error, request_json};
+    use super::{
+        ConfigCommands, exit_code_for_error, load_command_config, map_api_error, request_json,
+    };
     use crate::config::Config;
     use crate::error::AppError;
     use axum::http::StatusCode;
@@ -588,5 +608,33 @@ request_timeout_secs = 20
             .expect_err("expected config already exists error");
         assert!(matches!(err, AppError::Config(message) if message.contains("already exists")));
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn exit_codes_are_stable_for_error_categories() {
+        assert_eq!(
+            exit_code_for_error(&AppError::Validation("x".to_owned())),
+            2
+        );
+        assert_eq!(exit_code_for_error(&AppError::Config("x".to_owned())), 2);
+        assert_eq!(exit_code_for_error(&AppError::Address("x".to_owned())), 2);
+        assert_eq!(
+            exit_code_for_error(&AppError::Unauthorized("x".to_owned())),
+            3
+        );
+        assert_eq!(exit_code_for_error(&AppError::Forbidden("x".to_owned())), 3);
+        assert_eq!(exit_code_for_error(&AppError::NotFound("x".to_owned())), 4);
+        assert_eq!(exit_code_for_error(&AppError::Conflict("x".to_owned())), 5);
+        assert_eq!(exit_code_for_error(&AppError::Storage("x".to_owned())), 6);
+        assert_eq!(exit_code_for_error(&AppError::Crypto("x".to_owned())), 6);
+        assert_eq!(
+            exit_code_for_error(&AppError::Serialization("x".to_owned())),
+            6
+        );
+        assert_eq!(exit_code_for_error(&AppError::Server("x".to_owned())), 6);
+        assert_eq!(
+            exit_code_for_error(&AppError::Io(std::io::Error::other("io"))),
+            6
+        );
     }
 }
