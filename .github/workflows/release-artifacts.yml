@@ -1,0 +1,48 @@
+name: Release Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+            script: scripts/release-build.sh
+            artifact_glob: dist/*.tar.gz*
+          - os: windows-latest
+            shell: pwsh
+            script: scripts/release-build.ps1
+            artifact_glob: dist/*.zip*
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release artifact
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: bash "${{ matrix.script }}"
+
+      - name: Build release artifact (Windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: pwsh -File "${{ matrix.script }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}-release
+          path: ${{ matrix.artifact_glob }}

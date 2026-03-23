@@ -20,21 +20,44 @@
 
 ## Сборка артефактов
 
-### Linux
+### Linux (одной командой)
 
 ```bash
-cargo build --release
+bash scripts/release-build.sh
 ```
 
-Артефакт: `target/release/mia-secret`
+Артефакты:
+- `dist/mia-secret-v<version>-linux-x64.tar.gz`
+- `dist/mia-secret-v<version>-linux-x64.tar.gz.sha256`
 
-### Windows
+### Windows (одной командой)
 
 ```powershell
-cargo build --release
+pwsh -File scripts/release-build.ps1
 ```
 
-Артефакт: `target\release\mia-secret.exe`
+Артефакты:
+- `dist\mia-secret-v<version>-windows-x64.zip`
+- `dist\mia-secret-v<version>-windows-x64.zip.sha256`
+
+### Опционально: target triple
+
+Если нужен конкретный target triple:
+
+```bash
+bash scripts/release-build.sh x86_64-unknown-linux-gnu
+```
+
+```powershell
+pwsh -File scripts/release-build.ps1 -Target x86_64-pc-windows-msvc
+```
+
+## CI-сборка артефактов
+
+Workflow `.github/workflows/release-artifacts.yml`:
+- запускается вручную (`workflow_dispatch`) или при push тега вида `v*`;
+- собирает артефакты для Linux и Windows;
+- публикует их как GitHub Actions artifacts.
 
 ## Релизные заметки
 
