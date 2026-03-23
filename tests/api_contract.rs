@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,8 @@ struct TestDir {
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("mia-secret-contract-{name}-{}", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("mia-secret-contract-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).expect("failed to create temp dir");
         Self { path }
     }
@@ -74,6 +76,13 @@ fn assert_has_string(value: &Value, key: &str) {
     );
 }
 
+fn assert_exact_keys(value: &Value, expected: &[&str]) {
+    let object = value.as_object().expect("expected json object");
+    let actual = object.keys().map(|k| k.as_str()).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected, "unexpected key set: {value}");
+}
+
 #[tokio::test]
 async fn contract_health_and_readiness_payload() {
     let root = TestDir::new("health-ready");
@@ -93,11 +102,17 @@ async fn contract_health_and_readiness_payload() {
     assert_eq!(health_json.get("status"), Some(&json!("ok")));
     assert_has_string(&health_json, "version");
     assert!(
-        health_json.get("database_ready").and_then(Value::as_bool).is_some(),
+        health_json
+            .get("database_ready")
+            .and_then(Value::as_bool)
+            .is_some(),
         "database_ready must be bool"
     );
     assert!(
-        health_json.get("config_loaded").and_then(Value::as_bool).is_some(),
+        health_json
+            .get("config_loaded")
+            .and_then(Value::as_bool)
+            .is_some(),
         "config_loaded must be bool"
     );
 
@@ -112,7 +127,10 @@ async fn contract_health_and_readiness_payload() {
     assert_has_string(&ready_json, "version");
     let checks = ready_json.get("checks").expect("checks");
     assert!(
-        checks.get("config_loaded").and_then(Value::as_bool).is_some(),
+        checks
+            .get("config_loaded")
+            .and_then(Value::as_bool)
+            .is_some(),
         "checks.config_loaded must be bool"
     );
     assert!(
@@ -166,6 +184,163 @@ async fn contract_error_envelope_and_metrics_shape() {
     assert!(body.contains("mia_auth_failures_total"));
     assert!(body.contains("mia_token_created_total"));
     assert!(body.contains("mia_token_revoked_total"));
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test]
+async fn contract_safe_config_shape() {
+    let root = TestDir::new("safe-config");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "config-reader",
+            "scopes": ["config.read"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
+    let token_json: Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let cfg_resp = client
+        .get(format!("{base_url}/api/v1/config"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("config request");
+    assert_eq!(cfg_resp.status(), reqwest::StatusCode::OK);
+    let cfg_json: Value = cfg_resp.json().await.expect("config json");
+
+    assert_exact_keys(
+        &cfg_json,
+        &["general", "server", "security", "crypto", "storage", "cli"],
+    );
+    assert_exact_keys(
+        &cfg_json["server"],
+        &[
+            "host",
+            "port",
+            "request_timeout_secs",
+            "max_request_body_kb",
+            "protected_rate_limit_rps",
+        ],
+    );
+    assert_exact_keys(
+        &cfg_json["storage"],
+        &[
+            "auto_migrate",
+            "create_backup_before_write",
+            "max_backups",
+            "sqlite_busy_timeout_ms",
+        ],
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test]
+async fn contract_secret_and_token_payload_shape() {
+    let root = TestDir::new("secret-token-shape");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "contract-admin",
+            "scopes": ["tokens.manage", "secrets.write", "secrets.read", "secrets.delete"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
+    let token_json: Value = token_resp.json().await.expect("token json");
+    assert_exact_keys(&token_json, &["token", "record"]);
+    assert_has_string(&token_json, "token");
+    assert_exact_keys(
+        &token_json["record"],
+        &[
+            "id",
+            "name",
+            "scopes",
+            "created_at",
+            "expires_at",
+            "revoked_at",
+            "last_used_at",
+        ],
+    );
+    let token = token_json["token"].as_str().expect("token").to_owned();
+    let token_id = token_json["record"]["id"]
+        .as_str()
+        .expect("token id")
+        .to_owned();
+
+    let secret_resp = client
+        .post(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "path": "contract/item",
+            "resource": "db",
+            "login": "user",
+            "password": "pwd",
+            "url": "https://example.invalid",
+            "notes": "note",
+            "tags": ["a", "b"],
+            "custom_fields": {"x": 1}
+        }))
+        .send()
+        .await
+        .expect("create secret");
+    assert_eq!(secret_resp.status(), reqwest::StatusCode::OK);
+    let secret_json: Value = secret_resp.json().await.expect("secret json");
+    assert_exact_keys(
+        &secret_json,
+        &[
+            "id",
+            "path",
+            "resource",
+            "login",
+            "password",
+            "url",
+            "notes",
+            "tags",
+            "custom_fields",
+            "created_at",
+            "updated_at",
+        ],
+    );
+
+    let revoke_resp = client
+        .post(format!("{base_url}/api/v1/tokens/{token_id}/revoke"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("revoke token");
+    assert_eq!(revoke_resp.status(), reqwest::StatusCode::OK);
+    let revoke_json: Value = revoke_resp.json().await.expect("revoke json");
+    assert_exact_keys(
+        &revoke_json,
+        &[
+            "id",
+            "name",
+            "scopes",
+            "created_at",
+            "expires_at",
+            "revoked_at",
+            "last_used_at",
+        ],
+    );
 
     stop_server(shutdown_tx, handle).await;
 }
