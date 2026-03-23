@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,8 +43,77 @@ jobs:
         shell: pwsh
         run: pwsh -File "${{ matrix.script }}"
 
+      - name: Generate release notes and changelog
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/generate-release-notes.sh dist
+
+      - name: Smoke check artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(ls -1 dist/*.tar.gz | head -n1)"
+          workdir="$(mktemp -d)"
+          config="$workdir/mia-secret.toml"
+          port="48765"
+          tar -C "$workdir" -xzf "$tarball"
+          binary="$(find "$workdir" -type f -name mia-secret | head -n1)"
+          test -n "$binary"
+          "$binary" --version
+          "$binary" --help >/dev/null
+          "$binary" --config "$config" config init --force
+          "$binary" --config "$config" config validate
+          "$binary" --config "$config" init
+          "$binary" --config "$config" serve --host 127.0.0.1 --port "$port" >"$workdir/serve.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$workdir"' EXIT
+          sleep 3
+          "$binary" --config "$config" health --port "$port"
+          kill "$pid" >/dev/null 2>&1 || true
+          wait "$pid" || true
+
+      - name: Smoke check artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
+          if (-not $zip) { throw "zip artifact not found" }
+          $work = Join-Path $env:RUNNER_TEMP "mia-smoke"
+          if (Test-Path $work) { Remove-Item $work -Recurse -Force }
+          New-Item -ItemType Directory -Path $work | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath $work -Force
+          $bin = Join-Path $work "mia-secret.exe"
+          if (-not (Test-Path $bin)) { throw "binary not found in artifact: $bin" }
+          $config = Join-Path $work "mia-secret.toml"
+          $port = 48765
+          & $bin --version
+          & $bin --help | Out-Null
+          & $bin --config $config config init --force
+          & $bin --config $config config validate
+          & $bin --config $config init
+          $proc = Start-Process -FilePath $bin -ArgumentList @("--config", $config, "serve", "--host", "127.0.0.1", "--port", $port) -PassThru
+          try {
+            Start-Sleep -Seconds 3
+            & $bin --config $config health --port $port
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force
+            }
+          }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ runner.os }}-release
           path: ${{ matrix.artifact_glob }}
+
+      - name: Upload release metadata
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: |
+            dist/RELEASE_NOTES.md
+            dist/CHANGELOG.md

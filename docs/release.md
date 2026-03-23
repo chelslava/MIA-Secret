@@ -57,14 +57,27 @@ pwsh -File scripts/release-build.ps1 -Target x86_64-pc-windows-msvc
 Workflow `.github/workflows/release-artifacts.yml`:
 - запускается вручную (`workflow_dispatch`) или при push тега вида `v*`;
 - собирает артефакты для Linux и Windows;
+- выполняет smoke-check запуска собранного бинаря (`mia-secret --version`) на обеих платформах;
+- генерирует release metadata:
+  - `dist/RELEASE_NOTES.md`
+  - `dist/CHANGELOG.md`
 - публикует их как GitHub Actions artifacts.
+
+## Автогенерация Release Notes/Changelog локально
+
+```bash
+bash scripts/generate-release-notes.sh
+```
+
+```powershell
+pwsh -File scripts/generate-release-notes.ps1
+```
+
+Файлы будут созданы в `dist/` (или в указанной директории вторым аргументом).
 
 ## Релизные заметки
 
-В release notes включать:
-
-- версию;
-- список ключевых изменений;
+Используется автогенерация по коммитам. При необходимости перед публикацией можно вручную дополнить:
 - изменения API/CLI;
 - миграции/изменения формата данных;
 - известные ограничения и риски.
