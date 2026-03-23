@@ -178,6 +178,16 @@ async fn api_health_and_authz_middleware_behaviour() {
         reqwest::StatusCode::UNAUTHORIZED
     );
 
+    let metrics_resp = client
+        .get(format!("{base_url}/api/v1/metrics"))
+        .send()
+        .await
+        .expect("metrics request");
+    assert!(metrics_resp.status().is_success());
+    let metrics_text = metrics_resp.text().await.expect("metrics text");
+    assert!(metrics_text.contains("mia_http_requests_total"));
+    assert!(metrics_text.contains("path=\"/api/v1/health\""));
+
     stop_server(shutdown_tx, handle).await;
 }
 

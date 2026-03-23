@@ -82,6 +82,20 @@ Authorization: Bearer <token>
 }
 ```
 
+## Metrics
+
+`GET /api/v1/metrics`
+
+Возвращает метрики в текстовом формате Prometheus (`text/plain`).
+Endpoint доступен без токена и предназначен для локального мониторинга.
+
+Основные метрики:
+- `mia_http_requests_total`
+- `mia_http_errors_total`
+- `mia_http_timeouts_total`
+- `mia_http_requests_by_route_total{method,path,status}`
+- `mia_http_latency_ms_sum{method,path,status}`
+
 ## Секреты
 
 ### Создать секрет
@@ -316,3 +330,4 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
 * `timeout`: ограничение времени обработки запроса согласно `server.request_timeout_secs`.
 * `body-limit`: ограничение размера request body согласно `server.max_request_body_kb` (ответ `413 Payload Too Large` при превышении).
 * `rate-limit`: ограничение скорости для защищенных endpoint-ов согласно `server.protected_rate_limit_rps` (ответ `429 Too Many Requests` при превышении).
+* `metrics`: счётчики запросов/ошибок/таймаутов и суммарной latency по маршрутам.

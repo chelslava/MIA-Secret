@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +32,7 @@ struct ApiState {
     cfg: Config,
     service: Arc<AppService>,
     protected_request_timestamps: Arc<Mutex<VecDeque<Instant>>>,
+    metrics: Arc<Mutex<ApiMetrics>>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +130,27 @@ struct ApiErrorBody {
     trace_id: String,
 }
 
+#[derive(Debug, Default)]
+struct ApiMetrics {
+    total_requests: u64,
+    total_errors: u64,
+    total_timeouts: u64,
+    by_route: HashMap<RouteMetricKey, RouteMetricValue>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct RouteMetricKey {
+    method: String,
+    path: String,
+    status: u16,
+}
+
+#[derive(Debug, Default)]
+struct RouteMetricValue {
+    count: u64,
+    latency_sum_ms: u128,
+}
+
 pub async fn serve(cfg: Config) -> Result<(), AppError> {
     let app = build_app(cfg.clone())?;
     let addr = bind_addr(&cfg.server.host, cfg.server.port)?;
@@ -148,6 +170,7 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
         cfg: cfg.clone(),
         service,
         protected_request_timestamps: Arc::new(Mutex::new(VecDeque::new())),
+        metrics: Arc::new(Mutex::new(ApiMetrics::default())),
     };
 
     let protected_routes = Router::new()
@@ -168,10 +191,14 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
     let app = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/ready", get(readiness))
+        .route("/api/v1/metrics", get(metrics))
         .merge(protected_routes)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(max_request_body_bytes(&cfg)))
-        .layer(middleware::from_fn(access_log_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            access_log_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             timeout_middleware,
@@ -202,6 +229,10 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
         database_ready: Path::new(&state.cfg.general.database_path).exists(),
         config_loaded: true,
     })
+}
+
+async fn metrics(State(state): State<ApiState>) -> String {
+    render_prometheus_metrics(&state.metrics).await
 }
 
 async fn readiness(State(state): State<ApiState>) -> (StatusCode, Json<ReadinessResponse>) {
@@ -451,7 +482,11 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
     response
 }
 
-async fn access_log_middleware(req: Request, next: Next) -> Response {
+async fn access_log_middleware(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let trace_id = extract_trace_id_from_request(&req).unwrap_or_else(|| "n/a".to_owned());
@@ -459,6 +494,7 @@ async fn access_log_middleware(req: Request, next: Next) -> Response {
     let response = next.run(req).await;
     let status = response.status().as_u16();
     let elapsed_ms = start.elapsed().as_millis();
+    record_request_metrics(&state.metrics, &method, &path, status, elapsed_ms).await;
     tracing::info!(
         trace_id = %trace_id,
         method = %method,
@@ -552,6 +588,9 @@ fn required_scope_for_request(
     if method == Method::GET && path == "/api/v1/ready" {
         return Ok(None);
     }
+    if method == Method::GET && path == "/api/v1/metrics" {
+        return Ok(None);
+    }
     if method == Method::GET && path == "/api/v1/config" {
         return Ok(Some("config.read"));
     }
@@ -620,6 +659,84 @@ fn extract_trace_id_from_request(req: &Request) -> Option<String> {
     req.extensions()
         .get::<TraceId>()
         .map(|trace| trace.0.clone())
+}
+
+async fn record_request_metrics(
+    metrics: &Arc<Mutex<ApiMetrics>>,
+    method: &Method,
+    path: &str,
+    status: u16,
+    elapsed_ms: u128,
+) {
+    let mut metrics = metrics.lock().await;
+    metrics.total_requests += 1;
+    if status >= 400 {
+        metrics.total_errors += 1;
+    }
+    if status == StatusCode::REQUEST_TIMEOUT.as_u16() {
+        metrics.total_timeouts += 1;
+    }
+
+    let key = RouteMetricKey {
+        method: method.as_str().to_owned(),
+        path: path.to_owned(),
+        status,
+    };
+    let route = metrics.by_route.entry(key).or_default();
+    route.count += 1;
+    route.latency_sum_ms += elapsed_ms;
+}
+
+async fn render_prometheus_metrics(metrics: &Arc<Mutex<ApiMetrics>>) -> String {
+    let metrics = metrics.lock().await;
+    let mut lines = vec![
+        "# HELP mia_http_requests_total Total HTTP requests processed.".to_owned(),
+        "# TYPE mia_http_requests_total counter".to_owned(),
+        format!("mia_http_requests_total {}", metrics.total_requests),
+        "# HELP mia_http_errors_total Total HTTP requests with status >= 400.".to_owned(),
+        "# TYPE mia_http_errors_total counter".to_owned(),
+        format!("mia_http_errors_total {}", metrics.total_errors),
+        "# HELP mia_http_timeouts_total Total HTTP requests completed with 408.".to_owned(),
+        "# TYPE mia_http_timeouts_total counter".to_owned(),
+        format!("mia_http_timeouts_total {}", metrics.total_timeouts),
+        "# HELP mia_http_requests_by_route_total Requests grouped by method/path/status."
+            .to_owned(),
+        "# TYPE mia_http_requests_by_route_total counter".to_owned(),
+        "# HELP mia_http_latency_ms_sum Total latency sum in milliseconds by method/path/status."
+            .to_owned(),
+        "# TYPE mia_http_latency_ms_sum counter".to_owned(),
+    ];
+
+    let mut route_entries = metrics.by_route.iter().collect::<Vec<_>>();
+    route_entries.sort_by(|(a, _), (b, _)| {
+        (&a.path, &a.method, a.status).cmp(&(&b.path, &b.method, b.status))
+    });
+
+    for (key, value) in route_entries {
+        let labels = format!(
+            "method=\"{}\",path=\"{}\",status=\"{}\"",
+            escape_prometheus_label(&key.method),
+            escape_prometheus_label(&key.path),
+            key.status
+        );
+        lines.push(format!(
+            "mia_http_requests_by_route_total{{{labels}}} {}",
+            value.count
+        ));
+        lines.push(format!(
+            "mia_http_latency_ms_sum{{{labels}}} {}",
+            value.latency_sum_ms
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn escape_prometheus_label(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn bind_addr(host: &str, port: u16) -> Result<SocketAddr, AppError> {
@@ -779,6 +896,7 @@ mod tests {
             cfg,
             service,
             protected_request_timestamps: Arc::new(Mutex::new(VecDeque::new())),
+            metrics: Arc::new(Mutex::new(ApiMetrics::default())),
         }
     }
 
@@ -791,6 +909,10 @@ mod tests {
         );
         assert_eq!(
             required_scope_for_request(&state, &Method::GET, "/api/v1/ready").expect("ready"),
+            None
+        );
+        assert_eq!(
+            required_scope_for_request(&state, &Method::GET, "/api/v1/metrics").expect("metrics"),
             None
         );
         assert_eq!(
@@ -945,10 +1067,22 @@ mod tests {
             cfg,
             service: state.service.clone(),
             protected_request_timestamps: Arc::new(Mutex::new(VecDeque::new())),
+            metrics: Arc::new(Mutex::new(ApiMetrics::default())),
         };
 
         assert!(allow_protected_request(&state).await);
         assert!(!allow_protected_request(&state).await);
+    }
+
+    #[tokio::test]
+    async fn render_prometheus_metrics_contains_expected_lines() {
+        let metrics = Arc::new(Mutex::new(ApiMetrics::default()));
+        record_request_metrics(&metrics, &Method::GET, "/api/v1/health", 200, 4).await;
+        record_request_metrics(&metrics, &Method::GET, "/api/v1/health", 503, 7).await;
+        let text = render_prometheus_metrics(&metrics).await;
+        assert!(text.contains("mia_http_requests_total 2"));
+        assert!(text.contains("mia_http_errors_total 1"));
+        assert!(text.contains("path=\"/api/v1/health\""));
     }
 
     #[test]
