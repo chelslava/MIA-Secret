@@ -40,6 +40,61 @@ struct HealthResponse {
     config_loaded: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SafeConfigResponse {
+    general: SafeGeneralConfig,
+    server: SafeServerConfig,
+    security: SafeSecurityConfig,
+    crypto: SafeCryptoConfig,
+    storage: SafeStorageConfig,
+    cli: SafeCliConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SafeGeneralConfig {
+    data_dir: String,
+    database_path: String,
+    log_level: String,
+    enable_file_logging: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SafeServerConfig {
+    host: String,
+    port: u16,
+    request_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SafeSecurityConfig {
+    token_header: String,
+    lock_timeout_secs: u64,
+    max_failed_attempts: u32,
+    min_master_password_length: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SafeCryptoConfig {
+    argon2_memory_kb: u32,
+    argon2_time_cost: u32,
+    argon2_parallelism: u32,
+    encrypt_notes: bool,
+    encrypt_custom_fields: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SafeStorageConfig {
+    auto_migrate: bool,
+    create_backup_before_write: bool,
+    max_backups: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SafeCliConfig {
+    output_format: String,
+    interactive: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorEnvelope {
     error: ApiErrorBody,
@@ -82,6 +137,7 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
         .route("/api/v1/secrets/by-path/{*path}", get(get_secret_by_path))
         .route("/api/v1/tokens", post(create_token).get(list_tokens))
         .route("/api/v1/tokens/{id}/revoke", post(revoke_token))
+        .route("/api/v1/config", get(read_config))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authz_middleware,
@@ -121,6 +177,48 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
         database_ready: Path::new(&state.cfg.general.database_path).exists(),
         config_loaded: true,
     })
+}
+
+async fn read_config(
+    State(state): State<ApiState>,
+) -> Result<Json<SafeConfigResponse>, ApiHttpError> {
+    let cfg = &state.cfg;
+    let response = SafeConfigResponse {
+        general: SafeGeneralConfig {
+            data_dir: cfg.general.data_dir.clone(),
+            database_path: cfg.general.database_path.clone(),
+            log_level: cfg.general.log_level.clone(),
+            enable_file_logging: cfg.general.enable_file_logging,
+        },
+        server: SafeServerConfig {
+            host: cfg.server.host.clone(),
+            port: cfg.server.port,
+            request_timeout_secs: cfg.server.request_timeout_secs,
+        },
+        security: SafeSecurityConfig {
+            token_header: cfg.security.token_header.clone(),
+            lock_timeout_secs: cfg.security.lock_timeout_secs,
+            max_failed_attempts: cfg.security.max_failed_attempts,
+            min_master_password_length: cfg.security.min_master_password_length,
+        },
+        crypto: SafeCryptoConfig {
+            argon2_memory_kb: cfg.crypto.argon2_memory_kb,
+            argon2_time_cost: cfg.crypto.argon2_time_cost,
+            argon2_parallelism: cfg.crypto.argon2_parallelism,
+            encrypt_notes: cfg.crypto.encrypt_notes,
+            encrypt_custom_fields: cfg.crypto.encrypt_custom_fields,
+        },
+        storage: SafeStorageConfig {
+            auto_migrate: cfg.storage.auto_migrate,
+            create_backup_before_write: cfg.storage.create_backup_before_write,
+            max_backups: cfg.storage.max_backups,
+        },
+        cli: SafeCliConfig {
+            output_format: cfg.cli.output_format.clone(),
+            interactive: cfg.cli.interactive,
+        },
+    };
+    Ok(Json(response))
 }
 
 async fn create_secret(
@@ -312,6 +410,9 @@ fn required_scope_for_request(
 ) -> Result<Option<&'static str>, AppError> {
     if method == Method::GET && path == "/api/v1/health" {
         return Ok(None);
+    }
+    if method == Method::GET && path == "/api/v1/config" {
+        return Ok(Some("config.read"));
     }
 
     if path == "/api/v1/secrets" {

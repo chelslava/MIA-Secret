@@ -102,11 +102,21 @@ async fn api_health_and_authz_middleware_behaviour() {
     let unauthorized_body: serde_json::Value = unauthorized.json().await.expect("json body");
     assert_eq!(unauthorized_body["error"]["code"], "unauthorized");
 
+    let unauthorized_config = client
+        .get(format!("{base_url}/api/v1/config"))
+        .send()
+        .await
+        .expect("unauthorized config request");
+    assert_eq!(
+        unauthorized_config.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
     let first_token_resp = client
         .post(format!("{base_url}/api/v1/tokens"))
         .json(&json!({
             "name": "bootstrap",
-            "scopes": ["secrets.read"]
+            "scopes": ["secrets.read", "config.read"]
         }))
         .send()
         .await
@@ -131,6 +141,17 @@ async fn api_health_and_authz_middleware_behaviour() {
     assert_eq!(forbidden_write.status(), reqwest::StatusCode::FORBIDDEN);
     let forbidden_body: serde_json::Value = forbidden_write.json().await.expect("json body");
     assert_eq!(forbidden_body["error"]["code"], "forbidden");
+
+    let config_resp = client
+        .get(format!("{base_url}/api/v1/config"))
+        .bearer_auth(&bearer)
+        .send()
+        .await
+        .expect("config request");
+    assert!(config_resp.status().is_success());
+    let config_json: serde_json::Value = config_resp.json().await.expect("config json");
+    assert_eq!(config_json["server"]["host"], "127.0.0.1");
+    assert!(config_json["server"]["port"].is_number());
 
     let second_token_without_auth = client
         .post(format!("{base_url}/api/v1/tokens"))

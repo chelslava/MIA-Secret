@@ -230,6 +230,33 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
 }
 ```
 
+## Конфигурация
+
+### Безопасное чтение конфигурации
+
+`GET /api/v1/config`
+
+Возвращает только безопасные поля конфигурации (без ключевого материала и без секретов).
+Требует scope `config.read`.
+
+Пример ответа:
+
+```json
+{
+  "general": {
+    "data_dir": "./data",
+    "database_path": "./data/secrets.db",
+    "log_level": "info",
+    "enable_file_logging": true
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 3765,
+    "request_timeout_secs": 30
+  }
+}
+```
+
 ## Скоупы
 
 Поддерживаемые значения `scopes`:
@@ -241,6 +268,7 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
 * `secrets.list`
 * `config.read`
 * `service.health`
+* `config.read`
 
 ## Замечания По Авторизации
 
