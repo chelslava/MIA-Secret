@@ -43,3 +43,18 @@ jobs:
 
       - name: API contract tests
         run: cargo test --test api_contract
+
+  cli-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: CLI smoke tests
+        run: cargo test --test cli_smoke

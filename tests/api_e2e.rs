@@ -305,7 +305,7 @@ async fn api_expired_token_is_rejected() {
         .json(&json!({
             "name": "expiring",
             "scopes": ["secrets.list"],
-            "expires_at": now + 1
+            "expires_at": now + 5
         }))
         .send()
         .await
@@ -317,7 +317,7 @@ async fn api_expired_token_is_rejected() {
         .expect("expiring token")
         .to_owned();
 
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
     let expired_access = client
         .get(format!("{base_url}/api/v1/secrets"))
