@@ -25,6 +25,7 @@ const DEFAULT_ARGON2_TIME_COST: u32 = 3;
 const DEFAULT_ARGON2_PARALLELISM: u32 = 4;
 const DEFAULT_OUTPUT_FORMAT: &str = "table";
 const DEFAULT_MAX_BACKUPS: u32 = 10;
+const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 const MIN_ARGON2_MEMORY_KB: u32 = 65_536;
 const MIN_ARGON2_TIME_COST: u32 = 3;
@@ -85,6 +86,7 @@ pub struct StorageConfig {
     pub auto_migrate: bool,
     pub create_backup_before_write: bool,
     pub max_backups: u32,
+    pub sqlite_busy_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,6 +154,7 @@ impl Default for StorageConfig {
             auto_migrate: true,
             create_backup_before_write: true,
             max_backups: DEFAULT_MAX_BACKUPS,
+            sqlite_busy_timeout_ms: DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         }
     }
 }
@@ -221,6 +224,11 @@ impl Config {
         if self.general.database_path.trim().is_empty() {
             return Err(AppError::Validation(
                 "general.database_path must not be empty".to_owned(),
+            ));
+        }
+        if self.storage.sqlite_busy_timeout_ms == 0 {
+            return Err(AppError::Validation(
+                "storage.sqlite_busy_timeout_ms must be greater than 0".to_owned(),
             ));
         }
 
@@ -383,6 +391,10 @@ mod tests {
 
         cfg = Config::default();
         cfg.general.database_path = " ".to_owned();
+        assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
+
+        cfg = Config::default();
+        cfg.storage.sqlite_busy_timeout_ms = 0;
         assert!(matches!(cfg.validate(), Err(AppError::Validation(_))));
     }
 

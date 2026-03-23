@@ -40,4 +40,5 @@
 
 4. Если растет `mia_http_timeouts_total`:
    - проверить `server.request_timeout_secs`;
+   - проверить `storage.sqlite_busy_timeout_ms`;
    - проверить нагрузку на SQLite и длительные операции.

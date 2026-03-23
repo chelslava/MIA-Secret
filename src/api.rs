@@ -109,6 +109,7 @@ struct SafeStorageConfig {
     auto_migrate: bool,
     create_backup_before_write: bool,
     max_backups: u32,
+    sqlite_busy_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,6 +337,7 @@ async fn read_config(
             auto_migrate: cfg.storage.auto_migrate,
             create_backup_before_write: cfg.storage.create_backup_before_write,
             max_backups: cfg.storage.max_backups,
+            sqlite_busy_timeout_ms: cfg.storage.sqlite_busy_timeout_ms,
         },
         cli: SafeCliConfig {
             output_format: cfg.cli.output_format.clone(),

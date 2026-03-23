@@ -303,6 +303,7 @@ fn storage_backup_rotation_keeps_configured_limit() {
         create_backup_before_write: true,
         max_backups: 2,
         backup_dir: backup_dir.clone(),
+        sqlite_busy_timeout_ms: 5_000,
     };
     let storage = SqliteStorage::new_with_options(&cfg.general.database_path, options)
         .expect("storage with backup options");

@@ -15,6 +15,7 @@ pub struct StorageOptions {
     pub create_backup_before_write: bool,
     pub max_backups: usize,
     pub backup_dir: PathBuf,
+    pub sqlite_busy_timeout_ms: u64,
 }
 
 impl Default for StorageOptions {
@@ -23,6 +24,7 @@ impl Default for StorageOptions {
             create_backup_before_write: false,
             max_backups: 10,
             backup_dir: PathBuf::from("./data/backups"),
+            sqlite_busy_timeout_ms: 5_000,
         }
     }
 }
@@ -44,6 +46,7 @@ impl SqliteStorage {
             create_backup_before_write: cfg.storage.create_backup_before_write,
             max_backups: cfg.storage.max_backups.max(1) as usize,
             backup_dir: PathBuf::from(&cfg.general.data_dir).join("backups"),
+            sqlite_busy_timeout_ms: cfg.storage.sqlite_busy_timeout_ms,
         };
         Self::new_with_options(&cfg.general.database_path, options)
     }
@@ -367,7 +370,11 @@ impl SqliteStorage {
     }
 
     fn open_conn(&self) -> Result<Connection, AppError> {
-        Connection::open(&self.db_path).map_err(Into::into)
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(std::time::Duration::from_millis(
+            self.options.sqlite_busy_timeout_ms,
+        ))?;
+        Ok(conn)
     }
 }
 

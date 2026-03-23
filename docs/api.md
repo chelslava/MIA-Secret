@@ -301,6 +301,12 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
     "request_timeout_secs": 30,
     "max_request_body_kb": 64,
     "protected_rate_limit_rps": 30
+  },
+  "storage": {
+    "auto_migrate": true,
+    "create_backup_before_write": true,
+    "max_backups": 10,
+    "sqlite_busy_timeout_ms": 5000
   }
 }
 ```
