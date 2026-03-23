@@ -162,12 +162,12 @@ impl AppService {
         let name = required_trim(req.name, "name")?;
         let scopes = normalize_scopes(req.scopes)?;
         let now = now_unix();
-        if let Some(expires_at) = req.expires_at {
-            if expires_at <= now {
-                return Err(AppError::Validation(
-                    "expires_at must be in the future".to_owned(),
-                ));
-            }
+        if let Some(expires_at) = req.expires_at
+            && expires_at <= now
+        {
+            return Err(AppError::Validation(
+                "expires_at must be in the future".to_owned(),
+            ));
         }
         let token_plain = generate_plain_token()?;
         let token_hash = self.crypto.hash_token(&token_plain);
@@ -223,10 +223,10 @@ impl AppService {
         if record.revoked_at.is_some() {
             return Err(AppError::Unauthorized("token revoked".to_owned()));
         }
-        if let Some(expires_at) = record.expires_at {
-            if expires_at <= now {
-                return Err(AppError::Unauthorized("token expired".to_owned()));
-            }
+        if let Some(expires_at) = record.expires_at
+            && expires_at <= now
+        {
+            return Err(AppError::Unauthorized("token expired".to_owned()));
         }
         if !record.scopes.iter().any(|scope| scope == required_scope) {
             return Err(AppError::Forbidden(format!(

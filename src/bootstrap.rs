@@ -23,10 +23,10 @@ pub fn ensure_layout(cfg: &Config) -> Result<(), AppError> {
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     Ok(())
@@ -37,10 +37,10 @@ fn ensure_file(path: &Path) -> Result<(), AppError> {
         return Ok(());
     }
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     OpenOptions::new().create_new(true).write(true).open(path)?;
@@ -53,10 +53,10 @@ fn ensure_random_file(path: &Path, len: usize) -> Result<(), AppError> {
         return Ok(());
     }
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let mut bytes = vec![0u8; len];
@@ -124,10 +124,9 @@ fn fill_random_bytes(buffer: &mut [u8]) -> Result<(), AppError> {
                 )
             };
             if status != 0 {
-                return Err(AppError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("BCryptGenRandom failed with status {status}"),
-                )));
+                return Err(AppError::Io(std::io::Error::other(format!(
+                    "BCryptGenRandom failed with status {status}"
+                ))));
             }
             offset += chunk_len;
         }
@@ -136,8 +135,7 @@ fn fill_random_bytes(buffer: &mut [u8]) -> Result<(), AppError> {
     }
 
     #[allow(unreachable_code)]
-    Err(AppError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
+    Err(AppError::Io(std::io::Error::other(
         "random byte generation is not supported on this platform",
     )))
 }

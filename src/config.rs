@@ -28,7 +28,7 @@ const MIN_ARGON2_MEMORY_KB: u32 = 65_536;
 const MIN_ARGON2_TIME_COST: u32 = 3;
 const MIN_ARGON2_PARALLELISM: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -94,19 +94,6 @@ pub struct CliConfig {
 pub struct ConfigOverrides {
     pub host: Option<String>,
     pub port: Option<u16>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            server: ServerConfig::default(),
-            security: SecurityConfig::default(),
-            crypto: CryptoConfig::default(),
-            storage: StorageConfig::default(),
-            cli: CliConfig::default(),
-        }
-    }
 }
 
 impl Default for GeneralConfig {
@@ -288,10 +275,10 @@ pub fn write_default(path: &Path, force: bool) -> Result<(), AppError> {
         )));
     }
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let rendered = toml::to_string_pretty(&Config::default())
@@ -306,10 +293,10 @@ fn validate_loopback_host(host: &str) -> Result<(), AppError> {
         return Ok(());
     }
 
-    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
-        if addr.is_loopback() {
-            return Ok(());
-        }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>()
+        && addr.is_loopback()
+    {
+        return Ok(());
     }
 
     Err(AppError::Validation(format!(
