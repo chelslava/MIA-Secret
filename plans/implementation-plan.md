@@ -47,7 +47,7 @@
 3. Улучшить коды ошибок CLI при API-ошибках (маппинг в категории из ТЗ).
 
 ### 4. Тесты и качество (средний приоритет)
-1. Добавить e2e-тесты API поверх HTTP (не только service/storage).
+1. [x] Добавить e2e-тесты API поверх HTTP (не только service/storage).
 2. [~] Добавить негативные security-тесты: истекший/отозванный токен, missing scope, loopback-only bind.
 3. Включить в CI `clippy -D warnings`, `fmt --check`, `test`.
 

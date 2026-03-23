@@ -54,6 +54,17 @@ struct ApiErrorBody {
 }
 
 pub async fn serve(cfg: Config) -> Result<(), AppError> {
+    let app = build_app(cfg.clone())?;
+    let addr = bind_addr(&cfg.server.host, cfg.server.port)?;
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("listening on http://{addr}");
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|err| AppError::Server(err.to_string()))
+}
+
+pub fn build_app(cfg: Config) -> Result<Router, AppError> {
     let storage = Arc::new(SqliteStorage::from_config(&cfg)?);
     let crypto = CryptoService::from_config(&cfg)?;
     let service = Arc::new(AppService::new(storage, crypto));
@@ -86,13 +97,7 @@ pub async fn serve(cfg: Config) -> Result<(), AppError> {
         ))
         .layer(middleware::from_fn(trace_id_middleware));
 
-    let addr = bind_addr(&cfg.server.host, cfg.server.port)?;
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("listening on http://{addr}");
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|err| AppError::Server(err.to_string()))
+    Ok(app)
 }
 
 pub async fn check_health(cfg: &Config) -> Result<(), AppError> {
