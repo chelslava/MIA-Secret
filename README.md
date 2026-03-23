@@ -2,6 +2,34 @@
 
 MIA Secret - локальный менеджер секретов на Rust с CLI и HTTP API.
 
+## Сборка
+
+### Linux
+
+```bash
+rustup toolchain install stable
+cargo build --release
+```
+
+Готовый бинарник: `target/release/mia-secret`.
+
+### Windows (PowerShell)
+
+```powershell
+rustup toolchain install stable-msvc
+cargo build --release
+```
+
+Готовый бинарник: `target\release\mia-secret.exe`.
+
+Для CI-проверок качества:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --tests
+```
+
 ## Быстрый старт
 
 1. Убедитесь, что установлен Rust toolchain.
@@ -169,3 +197,4 @@ $env:MIA_SECRET__GENERAL__LOG_LEVEL = "debug"
 * `POST /api/v1/tokens/{id}/revoke` - отозвать токен.
 
 Подробные примеры запросов и ответов см. в `docs/api.md`, а справку по CLI - в `docs/cli.md`.
+Критерии приемки и релизный процесс: `docs/acceptance-checklist.md`, `docs/release.md`.

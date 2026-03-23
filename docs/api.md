@@ -268,7 +268,6 @@ curl -H "Authorization: Bearer $MIA_SECRET_TOKEN" \
 * `secrets.list`
 * `config.read`
 * `service.health`
-* `config.read`
 
 ## Замечания По Авторизации
 
