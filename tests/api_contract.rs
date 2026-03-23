@@ -83,6 +83,20 @@ fn assert_exact_keys(value: &Value, expected: &[&str]) {
     assert_eq!(actual, expected, "unexpected key set: {value}");
 }
 
+fn assert_error_contract(value: &Value, expected_code: &str) {
+    let error = value.get("error").expect("error envelope");
+    assert_exact_keys(error, &["code", "message", "traceId"]);
+    assert_eq!(error.get("code"), Some(&json!(expected_code)));
+    assert!(
+        error.get("message").and_then(Value::as_str).is_some(),
+        "error.message must be string"
+    );
+    assert!(
+        error.get("traceId").and_then(Value::as_str).is_some(),
+        "error.traceId must be string"
+    );
+}
+
 #[tokio::test]
 async fn contract_health_and_readiness_payload() {
     let root = TestDir::new("health-ready");
@@ -167,10 +181,7 @@ async fn contract_error_envelope_and_metrics_shape() {
         .expect("unauthorized request");
     assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
     let unauthorized_json: Value = unauthorized.json().await.expect("unauthorized json");
-    let error = unauthorized_json.get("error").expect("error envelope");
-    assert_has_string(error, "code");
-    assert_has_string(error, "message");
-    assert_has_string(error, "traceId");
+    assert_error_contract(&unauthorized_json, "unauthorized");
 
     let metrics = client
         .get(format!("{base_url}/api/v1/metrics"))
@@ -184,6 +195,137 @@ async fn contract_error_envelope_and_metrics_shape() {
     assert!(body.contains("mia_auth_failures_total"));
     assert!(body.contains("mia_token_created_total"));
     assert!(body.contains("mia_token_revoked_total"));
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test]
+async fn contract_negative_error_shapes_for_common_failures() {
+    let root = TestDir::new("negative-errors");
+    let cfg = test_config(root.path());
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let unauthorized = client
+        .get(format!("{base_url}/api/v1/secrets"))
+        .send()
+        .await
+        .expect("unauthorized request");
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let unauthorized_json: Value = unauthorized.json().await.expect("unauthorized json");
+    assert_error_contract(&unauthorized_json, "unauthorized");
+
+    let admin_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "admin",
+            "scopes": ["tokens.manage", "secrets.read", "secrets.list", "secrets.write"]
+        }))
+        .send()
+        .await
+        .expect("admin token create");
+    assert_eq!(admin_resp.status(), reqwest::StatusCode::OK);
+    let admin_json: Value = admin_resp.json().await.expect("admin token json");
+    let admin_token = admin_json["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    let limited_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "name": "limited",
+            "scopes": ["config.read"]
+        }))
+        .send()
+        .await
+        .expect("limited token create");
+    assert_eq!(limited_resp.status(), reqwest::StatusCode::OK);
+    let limited_json: Value = limited_resp.json().await.expect("limited token json");
+    let limited_token = limited_json["token"].as_str().expect("token").to_owned();
+
+    let forbidden = client
+        .post(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&limited_token)
+        .json(&json!({
+            "path": "forbidden/path",
+            "password": "pwd"
+        }))
+        .send()
+        .await
+        .expect("forbidden request");
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    let forbidden_json: Value = forbidden.json().await.expect("forbidden json");
+    assert_error_contract(&forbidden_json, "forbidden");
+
+    let invalid_uuid = client
+        .get(format!("{base_url}/api/v1/secrets/not-a-uuid"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("invalid uuid request");
+    assert_eq!(invalid_uuid.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_uuid_json: Value = invalid_uuid.json().await.expect("invalid uuid json");
+    assert_error_contract(&invalid_uuid_json, "validation_error");
+
+    let missing_secret = client
+        .get(format!("{base_url}/api/v1/secrets/{}", Uuid::new_v4()))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("missing secret request");
+    assert_eq!(missing_secret.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing_secret_json: Value = missing_secret.json().await.expect("missing secret json");
+    assert_error_contract(&missing_secret_json, "not_found");
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test]
+async fn contract_rate_limited_error_shape() {
+    let root = TestDir::new("rate-limited-error");
+    let mut cfg = test_config(root.path());
+    cfg.server.protected_rate_limit_rps = 1;
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&json!({
+            "name": "list-token",
+            "scopes": ["secrets.list"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
+    let token_json: Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let first = client
+        .get(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("first protected request");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    let second = client
+        .get(format!("{base_url}/api/v1/secrets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("second protected request");
+    assert_eq!(second.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let second_json: Value = second.json().await.expect("rate limited json");
+    assert_error_contract(&second_json, "rate_limited");
 
     stop_server(shutdown_tx, handle).await;
 }
