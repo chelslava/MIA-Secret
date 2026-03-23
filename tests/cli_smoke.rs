@@ -499,6 +499,52 @@ fn cli_list_without_server_returns_operational_exit_code() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_health_fails_when_service_is_not_ready() {
+    let root = TestDir::new("health-not-ready");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let conn = Connection::open(&cfg.general.database_path).expect("open sqlite");
+    conn.execute("DROP TABLE IF EXISTS schema_migrations", [])
+        .expect("drop schema_migrations");
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+    let config_arg = config_path.to_string_lossy().into_owned();
+
+    let health = run_cli(root.path(), &["--config", &config_arg, "health"]);
+    assert!(
+        !health.status.success(),
+        "health must fail when readiness is degraded"
+    );
+    assert_eq!(
+        health.status.code(),
+        Some(6),
+        "degraded readiness should map to operational error code 6"
+    );
+    assert!(
+        stderr_text(&health).contains("service is not ready"),
+        "unexpected stderr: {}",
+        stderr_text(&health)
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_list_without_token_returns_auth_exit_code() {
     let root = TestDir::new("list-unauthorized");
     let config_path = root.path().join("mia-secret.toml");
@@ -655,6 +701,244 @@ async fn cli_token_revoke_invalid_uuid_returns_validation_exit_code() {
         stderr_text(&revoke).contains("invalid uuid"),
         "unexpected stderr: {}",
         stderr_text(&revoke)
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_add_without_token_returns_auth_exit_code() {
+    let root = TestDir::new("cli-add-unauthorized");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+    let config_arg = config_path.to_string_lossy().into_owned();
+
+    let add = run_cli(
+        root.path(),
+        &[
+            "--config",
+            &config_arg,
+            "add",
+            "apps/prod/db",
+            "--password",
+            "secret",
+        ],
+    );
+    assert!(!add.status.success(), "add should fail without token");
+    assert_eq!(
+        add.status.code(),
+        Some(3),
+        "auth failures should map to exit code 3, stderr={}",
+        stderr_text(&add)
+    );
+    assert!(
+        stderr_text(&add).contains("authentication error"),
+        "unexpected stderr: {}",
+        stderr_text(&add)
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_update_missing_secret_returns_not_found_exit_code() {
+    let root = TestDir::new("cli-update-missing");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&serde_json::json!({
+            "name": "editor",
+            "scopes": ["secrets.read", "secrets.write"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert!(token_resp.status().is_success());
+    let token_json: serde_json::Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let update = run_cli_with_env(
+        root.path(),
+        &[
+            "--config",
+            &config_arg,
+            "update",
+            "missing/secret/path",
+            "--password",
+            "new-secret",
+        ],
+        &[("MIA_SECRET_TOKEN", token.as_str())],
+    );
+    assert!(!update.status.success(), "update should fail for missing path");
+    assert_eq!(
+        update.status.code(),
+        Some(4),
+        "not found should map to exit code 4, stderr={}",
+        stderr_text(&update)
+    );
+    assert!(
+        stderr_text(&update).contains("not found"),
+        "unexpected stderr: {}",
+        stderr_text(&update)
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_delete_missing_secret_returns_not_found_exit_code() {
+    let root = TestDir::new("cli-delete-missing");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&serde_json::json!({
+            "name": "deleter",
+            "scopes": ["secrets.read", "secrets.delete"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert!(token_resp.status().is_success());
+    let token_json: serde_json::Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let delete = run_cli_with_env(
+        root.path(),
+        &["--config", &config_arg, "delete", "missing/secret/path"],
+        &[("MIA_SECRET_TOKEN", token.as_str())],
+    );
+    assert!(!delete.status.success(), "delete should fail for missing path");
+    assert_eq!(
+        delete.status.code(),
+        Some(4),
+        "not found should map to exit code 4, stderr={}",
+        stderr_text(&delete)
+    );
+    assert!(
+        stderr_text(&delete).contains("not found"),
+        "unexpected stderr: {}",
+        stderr_text(&delete)
+    );
+
+    stop_server(shutdown_tx, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_token_list_without_scope_returns_forbidden_exit_code() {
+    let root = TestDir::new("cli-token-list-forbidden");
+    let config_path = root.path().join("mia-secret.toml");
+
+    let mut cfg = Config::default();
+    let data_dir = root.path().join("data");
+    let db_path = data_dir.join("secrets.db");
+    cfg.general.data_dir = data_dir.to_string_lossy().into_owned();
+    cfg.general.database_path = db_path.to_string_lossy().into_owned();
+    cfg.server.host = "127.0.0.1".to_owned();
+    bootstrap::ensure_layout(&cfg).expect("ensure layout");
+
+    let (base_url, shutdown_tx, handle) = start_server(&cfg).await;
+    wait_until_healthy(&base_url).await;
+    let port = base_url
+        .rsplit(':')
+        .next()
+        .expect("port string")
+        .parse::<u16>()
+        .expect("port parse");
+    write_config(&config_path, port);
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post(format!("{base_url}/api/v1/tokens"))
+        .json(&serde_json::json!({
+            "name": "limited",
+            "scopes": ["secrets.list"]
+        }))
+        .send()
+        .await
+        .expect("token create");
+    assert!(token_resp.status().is_success());
+    let token_json: serde_json::Value = token_resp.json().await.expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_owned();
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let list = run_cli_with_env(
+        root.path(),
+        &["--config", &config_arg, "token", "list"],
+        &[("MIA_SECRET_TOKEN", token.as_str())],
+    );
+    assert!(
+        !list.status.success(),
+        "token list should fail without tokens.manage scope"
+    );
+    assert_eq!(
+        list.status.code(),
+        Some(3),
+        "forbidden should map to exit code 3, stderr={}",
+        stderr_text(&list)
+    );
+    assert!(
+        stderr_text(&list).contains("forbidden"),
+        "unexpected stderr: {}",
+        stderr_text(&list)
     );
 
     stop_server(shutdown_tx, handle).await;

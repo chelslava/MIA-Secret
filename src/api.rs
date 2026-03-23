@@ -215,14 +215,26 @@ pub fn build_app(cfg: Config) -> Result<Router, AppError> {
 
 pub async fn check_health(cfg: &Config) -> Result<(), AppError> {
     let url = health_url(&cfg.server.host, cfg.server.port)?;
+    let ready_url = readiness_url(&cfg.server.host, cfg.server.port)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.server.request_timeout_secs))
         .build()?;
     let response = client.get(url).send().await?.error_for_status()?;
     let body: HealthResponse = response.json().await?;
+    let ready_response = client.get(ready_url).send().await?;
+    let ready_status = ready_response.status();
+    let ready_body: ReadinessResponse = ready_response.json().await?;
+    if !ready_status.is_success() {
+        return Err(AppError::Server(format!(
+            "service is not ready: status={} database_connection={} schema_migrations_present={}",
+            ready_body.status,
+            ready_body.checks.database_connection,
+            ready_body.checks.schema_migrations_present
+        )));
+    }
     println!(
-        "{} version={} database_ready={} config_loaded={}",
-        body.status, body.version, body.database_ready, body.config_loaded
+        "{} version={} database_ready={} config_loaded={} readiness={}",
+        body.status, body.version, body.database_ready, body.config_loaded, ready_body.status
     );
     Ok(())
 }
@@ -809,6 +821,20 @@ fn health_url(host: &str, port: u16) -> Result<String, AppError> {
     Ok(format!("http://{formatted}:{port}/api/v1/health"))
 }
 
+fn readiness_url(host: &str, port: u16) -> Result<String, AppError> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(format!("http://localhost:{port}/api/v1/ready"));
+    }
+    let ip = host
+        .parse::<IpAddr>()
+        .map_err(|_| AppError::Address(format!("unable to parse server host: {host}")))?;
+    let formatted = match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    Ok(format!("http://{formatted}:{port}/api/v1/ready"))
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
@@ -1060,6 +1086,10 @@ mod tests {
 
         let localhost_url = health_url("localhost", 3765).expect("localhost health");
         assert_eq!(localhost_url, "http://localhost:3765/api/v1/health");
+        let localhost_ready = readiness_url("localhost", 3765).expect("localhost ready");
+        assert_eq!(localhost_ready, "http://localhost:3765/api/v1/ready");
+        let ipv6_ready = readiness_url("::1", 3765).expect("ipv6 ready");
+        assert_eq!(ipv6_ready, "http://[::1]:3765/api/v1/ready");
 
         assert!(matches!(
             bind_addr("not-an-ip", 1),
@@ -1067,6 +1097,10 @@ mod tests {
         ));
         assert!(matches!(
             health_url("not-an-ip", 1),
+            Err(AppError::Address(_))
+        ));
+        assert!(matches!(
+            readiness_url("not-an-ip", 1),
             Err(AppError::Address(_))
         ));
     }

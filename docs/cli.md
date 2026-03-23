@@ -36,7 +36,11 @@ mia-secret serve --host 127.0.0.1 --port 3765
 
 ### `health`
 
-Проверяет, что сервер отвечает на `/api/v1/health`.
+Проверяет liveness и readiness сервиса:
+* `/api/v1/health` должен отвечать `200`;
+* `/api/v1/ready` должен отвечать `200` и статус `ready`.
+
+Если readiness деградирован (`not_ready`), команда завершается с ошибкой.
 
 Опции:
 
