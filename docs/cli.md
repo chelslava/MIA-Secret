@@ -228,6 +228,31 @@ mia-secret config show
 mia-secret config validate
 ```
 
+### `import`
+
+Импортирует секреты из CSV-файлов других менеджеров паролей.
+
+#### `import csv`
+
+Опции:
+
+* `--file <path>` - путь к CSV-файлу.
+* `--source <generic|bitwarden>` - формат источника (по умолчанию `generic`).
+* `--on-duplicate <skip|update>` - политика дубликатов пути (по умолчанию `skip`).
+
+Примеры:
+
+```bash
+mia-secret import csv --file ./exports/generic.csv --source generic
+mia-secret import csv --file ./exports/bitwarden.csv --source bitwarden --on-duplicate update
+```
+
+Ожидаемые поля:
+
+* `generic`: `path,password` (обязательные), `resource,login,url,notes,tags` (опциональные).
+* `bitwarden`: `name,login_password` (обязательные), используются стандартные колонки Bitwarden export:
+  `folder,type,notes,login_uri,login_username,login_totp`.
+
 ## Токен Для Клиентских Команд
 
 Команды `add`, `get`, `list`, `update`, `delete`, `token list`, `token revoke` и другие запросы к API используют токен из переменной окружения `MIA_SECRET_TOKEN`.

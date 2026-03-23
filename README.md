@@ -153,6 +153,15 @@ cargo run -- token list
 cargo run -- token revoke 2f4c6f3f-1b43-4f89-8d66-3a1f6d7e8f10
 ```
 
+### Импорт Из Других Менеджеров
+
+Импорт из CSV:
+
+```bash
+cargo run -- import csv --file ./exports/generic.csv --source generic
+cargo run -- import csv --file ./exports/bitwarden.csv --source bitwarden --on-duplicate update
+```
+
 ## Токен Через Env
 
 CLI-команды, которые обращаются к локальному HTTP API, читают токен из переменной окружения `MIA_SECRET_TOKEN`.

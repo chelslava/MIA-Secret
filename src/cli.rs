@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -73,6 +73,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    Import {
+        #[command(subcommand)]
+        command: ImportCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,4 +102,28 @@ pub enum TokenCommands {
     Revoke {
         id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ImportCommands {
+    Csv {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, value_enum, default_value = "generic")]
+        source: ImportSource,
+        #[arg(long, value_enum, default_value = "skip")]
+        on_duplicate: DuplicateStrategy,
+    },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum ImportSource {
+    Generic,
+    Bitwarden,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum DuplicateStrategy {
+    Skip,
+    Update,
 }

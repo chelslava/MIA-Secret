@@ -128,6 +128,10 @@ interactive = true
     fs::write(path, rendered).expect("write config");
 }
 
+fn write_importable_config(path: &Path) {
+    write_config(path, 3765);
+}
+
 fn stdout_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -271,6 +275,46 @@ fn cli_init_creates_data_layout() {
     assert!(
         root.path().join("data").join("secrets.db").exists(),
         "database must exist"
+    );
+}
+
+#[test]
+fn cli_import_csv_generic_works_and_reports_summary() {
+    let root = TestDir::new("import-generic");
+    let config_path = root.path().join("mia-secret.toml");
+    write_importable_config(&config_path);
+    let csv_path = root.path().join("import.csv");
+    fs::write(
+        &csv_path,
+        "path,password,resource,login,url,notes,tags\napps/prod/db,secret,postgres,admin,https://example.invalid,note,\"prod,db\"\n",
+    )
+    .expect("write import csv");
+
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let file_arg = csv_path.to_string_lossy().into_owned();
+
+    let import = run_cli(
+        root.path(),
+        &[
+            "--config",
+            &config_arg,
+            "import",
+            "csv",
+            "--file",
+            &file_arg,
+            "--source",
+            "generic",
+        ],
+    );
+    assert!(
+        import.status.success(),
+        "import failed: stderr={}",
+        stderr_text(&import)
+    );
+    assert!(
+        stdout_text(&import).contains("Import summary: imported=1"),
+        "unexpected import output: {}",
+        stdout_text(&import)
     );
 }
 

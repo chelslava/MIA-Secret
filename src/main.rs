@@ -9,13 +9,19 @@ mod security;
 mod service;
 mod storage;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
-use cli::{Cli, Commands, ConfigCommands, TokenCommands};
+use cli::{
+    Cli, Commands, ConfigCommands, DuplicateStrategy, ImportCommands, ImportSource, TokenCommands,
+};
+use domain::{CreateSecretRequest, UpdateSecretRequest};
 use error::AppError;
 use security::redact_json;
 use serde::{Deserialize, Serialize};
+use service::AppService;
 use storage::SqliteStorage;
 
 #[tokio::main]
@@ -168,6 +174,7 @@ async fn dispatch(cli: Cli) -> Result<(), AppError> {
             let cfg = load_command_config(cli.config, None)?;
             handle_token_command(&cfg, command).await
         }
+        Commands::Import { command } => handle_import_command(cli.config, command),
     }
 }
 
@@ -238,6 +245,261 @@ async fn handle_token_command(
             )
             .await
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImportSecretRow {
+    path: String,
+    resource: Option<String>,
+    login: Option<String>,
+    password: String,
+    url: Option<String>,
+    notes: Option<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ImportSummary {
+    imported: usize,
+    updated: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+fn handle_import_command(path: Option<PathBuf>, command: ImportCommands) -> Result<(), AppError> {
+    match command {
+        ImportCommands::Csv {
+            file,
+            source,
+            on_duplicate,
+        } => import_csv(path, &file, source, on_duplicate),
+    }
+}
+
+fn import_csv(
+    config_path: Option<PathBuf>,
+    file: &std::path::Path,
+    source: ImportSource,
+    on_duplicate: DuplicateStrategy,
+) -> Result<(), AppError> {
+    let cfg = load_command_config(config_path, None)?;
+    bootstrap::ensure_layout(&cfg)?;
+    let service = build_local_service(&cfg)?;
+    let rows = parse_import_csv(file, source)?;
+    if rows.is_empty() {
+        return Err(AppError::Validation(format!(
+            "import file {} does not contain any valid rows",
+            file.display()
+        )));
+    }
+
+    let mut summary = ImportSummary::default();
+    for (index, row) in rows.into_iter().enumerate() {
+        match upsert_import_row(&service, row, on_duplicate.clone()) {
+            Ok(ImportResult::Imported) => summary.imported += 1,
+            Ok(ImportResult::Updated) => summary.updated += 1,
+            Ok(ImportResult::Skipped) => summary.skipped += 1,
+            Err(err) => {
+                summary.failed += 1;
+                eprintln!("import row {} failed: {err}", index + 1);
+            }
+        }
+    }
+
+    println!(
+        "Import summary: imported={} updated={} skipped={} failed={}",
+        summary.imported, summary.updated, summary.skipped, summary.failed
+    );
+
+    if summary.failed > 0 {
+        return Err(AppError::Server(format!(
+            "import finished with {} failed row(s)",
+            summary.failed
+        )));
+    }
+    Ok(())
+}
+
+fn build_local_service(cfg: &config::Config) -> Result<AppService, AppError> {
+    let storage = Arc::new(SqliteStorage::from_config(cfg)?);
+    let crypto = crypto::CryptoService::from_config(cfg)?;
+    Ok(AppService::new(storage, crypto))
+}
+
+#[derive(Debug)]
+enum ImportResult {
+    Imported,
+    Updated,
+    Skipped,
+}
+
+fn upsert_import_row(
+    service: &AppService,
+    row: ImportSecretRow,
+    on_duplicate: DuplicateStrategy,
+) -> Result<ImportResult, AppError> {
+    let create = CreateSecretRequest {
+        path: row.path.clone(),
+        resource: row.resource.clone(),
+        login: row.login.clone(),
+        password: row.password.clone(),
+        url: row.url.clone(),
+        notes: row.notes.clone(),
+        tags: Some(row.tags.clone()),
+        custom_fields: None,
+    };
+
+    match service.create_secret(create) {
+        Ok(_) => Ok(ImportResult::Imported),
+        Err(AppError::Conflict(_)) => match on_duplicate {
+            DuplicateStrategy::Skip => Ok(ImportResult::Skipped),
+            DuplicateStrategy::Update => {
+                let existing = service.get_secret_by_path(&row.path)?;
+                let update = UpdateSecretRequest {
+                    path: Some(row.path),
+                    resource: row.resource,
+                    login: row.login,
+                    password: Some(row.password),
+                    url: row.url,
+                    notes: row.notes,
+                    tags: Some(row.tags),
+                    custom_fields: None,
+                };
+                service.update_secret(existing.id, update)?;
+                Ok(ImportResult::Updated)
+            }
+        },
+        Err(err) => Err(err),
+    }
+}
+
+fn parse_import_csv(
+    file: &std::path::Path,
+    source: ImportSource,
+) -> Result<Vec<ImportSecretRow>, AppError> {
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_path(file)
+        .map_err(|err| {
+            AppError::Validation(format!("unable to read CSV {}: {err}", file.display()))
+        })?;
+    let headers = reader
+        .headers()
+        .map_err(|err| AppError::Validation(format!("unable to parse CSV headers: {err}")))?
+        .iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        let record = record
+            .map_err(|err| AppError::Validation(format!("unable to read CSV record: {err}")))?;
+        let mut row = HashMap::<String, String>::new();
+        for (index, value) in record.iter().enumerate() {
+            if let Some(header) = headers.get(index) {
+                row.insert(header.clone(), value.trim().to_owned());
+            }
+        }
+        if let Some(parsed) = parse_import_row(&row, source.clone())? {
+            rows.push(parsed);
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_import_row(
+    row: &HashMap<String, String>,
+    source: ImportSource,
+) -> Result<Option<ImportSecretRow>, AppError> {
+    match source {
+        ImportSource::Generic => parse_generic_row(row),
+        ImportSource::Bitwarden => parse_bitwarden_row(row),
+    }
+}
+
+fn parse_generic_row(row: &HashMap<String, String>) -> Result<Option<ImportSecretRow>, AppError> {
+    let path = get_csv_value(row, "path");
+    let password = get_csv_value(row, "password");
+    if path.is_empty() && password.is_empty() {
+        return Ok(None);
+    }
+    if path.is_empty() || password.is_empty() {
+        return Err(AppError::Validation(
+            "generic CSV row requires non-empty path and password".to_owned(),
+        ));
+    }
+    let tags = get_csv_value(row, "tags")
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    Ok(Some(ImportSecretRow {
+        path: path.to_owned(),
+        resource: optional_csv_value(row, "resource"),
+        login: optional_csv_value(row, "login"),
+        password: password.to_owned(),
+        url: optional_csv_value(row, "url"),
+        notes: optional_csv_value(row, "notes"),
+        tags,
+    }))
+}
+
+fn parse_bitwarden_row(row: &HashMap<String, String>) -> Result<Option<ImportSecretRow>, AppError> {
+    let name = get_csv_value(row, "name");
+    let password = get_csv_value(row, "login_password");
+    if name.is_empty() && password.is_empty() {
+        return Ok(None);
+    }
+    if name.is_empty() || password.is_empty() {
+        return Err(AppError::Validation(
+            "bitwarden CSV row requires non-empty name and login_password".to_owned(),
+        ));
+    }
+
+    let folder = get_csv_value(row, "folder");
+    let path = if folder.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{folder}/{name}")
+    };
+
+    let mut notes = optional_csv_value(row, "notes");
+    if let Some(totp) = optional_csv_value(row, "login_totp") {
+        notes = Some(match notes {
+            Some(value) if !value.is_empty() => format!("{value}\nTOTP: {totp}"),
+            _ => format!("TOTP: {totp}"),
+        });
+    }
+
+    let tags = if folder.is_empty() {
+        Vec::new()
+    } else {
+        vec![folder.to_owned()]
+    };
+
+    Ok(Some(ImportSecretRow {
+        path,
+        resource: optional_csv_value(row, "type"),
+        login: optional_csv_value(row, "login_username"),
+        password: password.to_owned(),
+        url: optional_csv_value(row, "login_uri"),
+        notes,
+        tags,
+    }))
+}
+
+fn get_csv_value<'a>(row: &'a HashMap<String, String>, key: &str) -> &'a str {
+    row.get(key).map(String::as_str).unwrap_or("")
+}
+
+fn optional_csv_value(row: &HashMap<String, String>, key: &str) -> Option<String> {
+    let value = get_csv_value(row, key).trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
     }
 }
 
@@ -347,7 +609,8 @@ fn exit_code_for_error(err: &AppError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigCommands, exit_code_for_error, load_command_config, map_api_error, request_json,
+        ConfigCommands, exit_code_for_error, load_command_config, map_api_error,
+        parse_bitwarden_row, parse_generic_row, request_json,
     };
     use crate::config::Config;
     use crate::error::AppError;
@@ -355,6 +618,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -635,6 +899,65 @@ request_timeout_secs = 20
         assert_eq!(
             exit_code_for_error(&AppError::Io(std::io::Error::other("io"))),
             6
+        );
+    }
+
+    #[test]
+    fn parse_generic_row_supports_optional_fields() {
+        let mut row = HashMap::new();
+        row.insert("path".to_owned(), "apps/prod/db".to_owned());
+        row.insert("password".to_owned(), "secret".to_owned());
+        row.insert("resource".to_owned(), "postgres".to_owned());
+        row.insert("login".to_owned(), "admin".to_owned());
+        row.insert("url".to_owned(), "https://example.invalid".to_owned());
+        row.insert("notes".to_owned(), "note".to_owned());
+        row.insert("tags".to_owned(), "prod, db".to_owned());
+
+        let parsed = parse_generic_row(&row)
+            .expect("parse generic")
+            .expect("row");
+        assert_eq!(parsed.path, "apps/prod/db");
+        assert_eq!(parsed.password, "secret");
+        assert_eq!(parsed.resource.as_deref(), Some("postgres"));
+        assert_eq!(parsed.login.as_deref(), Some("admin"));
+        assert_eq!(parsed.tags, vec!["prod", "db"]);
+    }
+
+    #[test]
+    fn parse_generic_row_rejects_missing_required_columns() {
+        let mut row = HashMap::new();
+        row.insert("path".to_owned(), "apps/prod/db".to_owned());
+        let err = parse_generic_row(&row).expect_err("must fail without password");
+        assert!(
+            matches!(err, AppError::Validation(message) if message.contains("path and password"))
+        );
+    }
+
+    #[test]
+    fn parse_bitwarden_row_maps_folder_and_totp() {
+        let mut row = HashMap::new();
+        row.insert("folder".to_owned(), "prod".to_owned());
+        row.insert("name".to_owned(), "db".to_owned());
+        row.insert("type".to_owned(), "login".to_owned());
+        row.insert("login_username".to_owned(), "root".to_owned());
+        row.insert("login_password".to_owned(), "pwd".to_owned());
+        row.insert("login_uri".to_owned(), "https://example.invalid".to_owned());
+        row.insert("notes".to_owned(), "legacy".to_owned());
+        row.insert("login_totp".to_owned(), "otpauth://totp/x".to_owned());
+
+        let parsed = parse_bitwarden_row(&row)
+            .expect("parse bitwarden")
+            .expect("row");
+        assert_eq!(parsed.path, "prod/db");
+        assert_eq!(parsed.password, "pwd");
+        assert_eq!(parsed.login.as_deref(), Some("root"));
+        assert_eq!(parsed.resource.as_deref(), Some("login"));
+        assert_eq!(parsed.tags, vec!["prod"]);
+        assert!(
+            parsed
+                .notes
+                .as_deref()
+                .is_some_and(|value| value.contains("TOTP:"))
         );
     }
 }
