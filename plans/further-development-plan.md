@@ -6,7 +6,7 @@
 ## Сводка статуса
 - Sprint A (Надежность и наблюдаемость): **закрыт**
 - Sprint B (Качество и тестирование): **высокий приоритет закрыт, идет расширение контрактов**
-- Sprint C (DX и релизы): **в прогрессе, release automation v2 закрыт**
+- Sprint C (DX и релизы): **закрыт**
 
 ## Что уже закрыто
 1. Надежность и guardrails
@@ -66,14 +66,12 @@
 - [x] Добавить smoke-check запуска собранного артефакта в release workflow.
 
 2. Эксплуатационная документация
-- [ ] Runbook backup/restore и ротации ключей (отдельный документ).
-- [ ] Quickstart для бинарной поставки без `cargo run` (с примерами для Linux/Windows).
+- [x] Runbook backup/restore и ротации ключей (отдельный документ).
+- [x] Quickstart для бинарной поставки без `cargo run` (с примерами для Linux/Windows).
 
 ## Ближайшие коммиты (актуальный порядок)
-1. Runbook backup/restore + key rotation.
-2. Quickstart для бинарной поставки (Linux/Windows) без `cargo run`.
-3. Расширение API contract tests по конфликтам и update/delete edge-cases.
-4. Snapshot-ожидания для API контрактов (если упростят review diff).
+1. Расширение API contract tests по конфликтам и update/delete edge-cases.
+2. Snapshot-ожидания для API контрактов (если упростят review diff).
 
 ## KPI (актуально)
 - Line coverage >= 75%: [x]
@@ -81,4 +79,4 @@
 - API contract checks в CI: [x]
 - CLI smoke checks в CI: [x]
 - Наблюдаемость (health/readiness/metrics + runbook) готова для локальной эксплуатации: [x]
-- Полный production-runbook (backup/restore/key-rotation/release notes automation): [~]
+- Полный production-runbook (backup/restore/key-rotation/release notes automation): [x]

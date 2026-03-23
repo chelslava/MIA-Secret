@@ -210,3 +210,5 @@ $env:MIA_SECRET__GENERAL__LOG_LEVEL = "debug"
 Подробные примеры запросов и ответов см. в `docs/api.md`, а справку по CLI - в `docs/cli.md`.
 Критерии приемки и релизный процесс: `docs/acceptance-checklist.md`, `docs/release.md`.
 Эксплуатационные метрики и диагностика: `docs/observability.md`.
+Эксплуатационный runbook backup/restore/key rotation: `docs/operations.md`.
+Quickstart для бинарной поставки: `docs/binary-quickstart.md`.
