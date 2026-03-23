@@ -1,0 +1,6 @@
+[
+  "auto_migrate",
+  "create_backup_before_write",
+  "max_backups",
+  "sqlite_busy_timeout_ms"
+]

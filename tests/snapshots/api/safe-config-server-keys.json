@@ -1,0 +1,7 @@
+[
+  "host",
+  "port",
+  "request_timeout_secs",
+  "max_request_body_kb",
+  "protected_rate_limit_rps"
+]

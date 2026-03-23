@@ -84,9 +84,27 @@ fn assert_exact_keys(value: &Value, expected: &[&str]) {
     assert_eq!(actual, expected, "unexpected key set: {value}");
 }
 
+fn snapshot_keys(name: &str) -> Vec<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+        .join("api")
+        .join(name);
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("unable to read snapshot {}: {err}", path.display()));
+    serde_json::from_str::<Vec<String>>(&raw)
+        .unwrap_or_else(|err| panic!("invalid snapshot format {}: {err}", path.display()))
+}
+
+fn assert_exact_keys_snapshot(value: &Value, snapshot_name: &str) {
+    let expected = snapshot_keys(snapshot_name);
+    let refs = expected.iter().map(String::as_str).collect::<Vec<_>>();
+    assert_exact_keys(value, &refs);
+}
+
 fn assert_error_contract(value: &Value, expected_code: &str) {
     let error = value.get("error").expect("error envelope");
-    assert_exact_keys(error, &["code", "message", "traceId"]);
+    assert_exact_keys_snapshot(error, "error-envelope-keys.json");
     assert_eq!(error.get("code"), Some(&json!(expected_code)));
     assert!(
         error.get("message").and_then(Value::as_str).is_some(),
@@ -395,29 +413,9 @@ async fn contract_safe_config_shape() {
     assert_eq!(cfg_resp.status(), reqwest::StatusCode::OK);
     let cfg_json: Value = cfg_resp.json().await.expect("config json");
 
-    assert_exact_keys(
-        &cfg_json,
-        &["general", "server", "security", "crypto", "storage", "cli"],
-    );
-    assert_exact_keys(
-        &cfg_json["server"],
-        &[
-            "host",
-            "port",
-            "request_timeout_secs",
-            "max_request_body_kb",
-            "protected_rate_limit_rps",
-        ],
-    );
-    assert_exact_keys(
-        &cfg_json["storage"],
-        &[
-            "auto_migrate",
-            "create_backup_before_write",
-            "max_backups",
-            "sqlite_busy_timeout_ms",
-        ],
-    );
+    assert_exact_keys_snapshot(&cfg_json, "safe-config-root-keys.json");
+    assert_exact_keys_snapshot(&cfg_json["server"], "safe-config-server-keys.json");
+    assert_exact_keys_snapshot(&cfg_json["storage"], "safe-config-storage-keys.json");
 
     stop_server(shutdown_tx, handle).await;
 }
@@ -444,18 +442,7 @@ async fn contract_secret_and_token_payload_shape() {
     let token_json: Value = token_resp.json().await.expect("token json");
     assert_exact_keys(&token_json, &["token", "record"]);
     assert_has_string(&token_json, "token");
-    assert_exact_keys(
-        &token_json["record"],
-        &[
-            "id",
-            "name",
-            "scopes",
-            "created_at",
-            "expires_at",
-            "revoked_at",
-            "last_used_at",
-        ],
-    );
+    assert_exact_keys_snapshot(&token_json["record"], "token-record-keys.json");
     let token = token_json["token"].as_str().expect("token").to_owned();
     let token_id = token_json["record"]["id"]
         .as_str()
@@ -480,22 +467,7 @@ async fn contract_secret_and_token_payload_shape() {
         .expect("create secret");
     assert_eq!(secret_resp.status(), reqwest::StatusCode::OK);
     let secret_json: Value = secret_resp.json().await.expect("secret json");
-    assert_exact_keys(
-        &secret_json,
-        &[
-            "id",
-            "path",
-            "resource",
-            "login",
-            "password",
-            "url",
-            "notes",
-            "tags",
-            "custom_fields",
-            "created_at",
-            "updated_at",
-        ],
-    );
+    assert_exact_keys_snapshot(&secret_json, "secret-payload-keys.json");
 
     let revoke_resp = client
         .post(format!("{base_url}/api/v1/tokens/{token_id}/revoke"))
@@ -505,18 +477,7 @@ async fn contract_secret_and_token_payload_shape() {
         .expect("revoke token");
     assert_eq!(revoke_resp.status(), reqwest::StatusCode::OK);
     let revoke_json: Value = revoke_resp.json().await.expect("revoke json");
-    assert_exact_keys(
-        &revoke_json,
-        &[
-            "id",
-            "name",
-            "scopes",
-            "created_at",
-            "expires_at",
-            "revoked_at",
-            "last_used_at",
-        ],
-    );
+    assert_exact_keys_snapshot(&revoke_json, "token-record-keys.json");
 
     stop_server(shutdown_tx, handle).await;
 }
