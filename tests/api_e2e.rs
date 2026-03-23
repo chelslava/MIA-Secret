@@ -186,6 +186,10 @@ async fn api_health_and_authz_middleware_behaviour() {
     assert!(metrics_resp.status().is_success());
     let metrics_text = metrics_resp.text().await.expect("metrics text");
     assert!(metrics_text.contains("mia_http_requests_total"));
+    assert!(metrics_text.contains("mia_auth_failures_total"));
+    assert!(metrics_text.contains("mia_rate_limited_total"));
+    assert!(metrics_text.contains("mia_token_created_total"));
+    assert!(metrics_text.contains("mia_token_revoked_total"));
     assert!(metrics_text.contains("path=\"/api/v1/health\""));
 
     stop_server(shutdown_tx, handle).await;

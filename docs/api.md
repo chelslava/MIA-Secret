@@ -93,6 +93,10 @@ Endpoint доступен без токена и предназначен для
 - `mia_http_requests_total`
 - `mia_http_errors_total`
 - `mia_http_timeouts_total`
+- `mia_auth_failures_total`
+- `mia_rate_limited_total`
+- `mia_token_created_total`
+- `mia_token_revoked_total`
 - `mia_http_requests_by_route_total{method,path,status}`
 - `mia_http_latency_ms_sum{method,path,status}`
 

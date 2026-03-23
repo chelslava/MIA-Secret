@@ -135,6 +135,10 @@ struct ApiMetrics {
     total_requests: u64,
     total_errors: u64,
     total_timeouts: u64,
+    auth_failures_total: u64,
+    rate_limited_total: u64,
+    token_created_total: u64,
+    token_revoked_total: u64,
     by_route: HashMap<RouteMetricKey, RouteMetricValue>,
 }
 
@@ -436,11 +440,12 @@ async fn create_token(
     Extension(trace): Extension<TraceId>,
     Json(req): Json<CreateTokenRequest>,
 ) -> Result<Json<TokenCreationResult>, ApiHttpError> {
-    state
+    let created = state
         .service
         .create_token(req)
-        .map(Json)
-        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))?;
+    increment_token_created(&state.metrics).await;
+    Ok(Json(created))
 }
 
 async fn list_tokens(
@@ -465,11 +470,12 @@ async fn revoke_token(
             Some(trace.0.clone()),
         )
     })?;
-    state
+    let revoked = state
         .service
         .revoke_token(id)
-        .map(Json)
-        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))
+        .map_err(|err| ApiHttpError::from_app(err, Some(trace.0)))?;
+    increment_token_revoked(&state.metrics).await;
+    Ok(Json(revoked))
 }
 
 async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
@@ -535,6 +541,7 @@ async fn authz_middleware(
 ) -> Result<Response, ApiHttpError> {
     let trace_id = extract_trace_id_from_request(&req);
     if !allow_protected_request(&state).await {
+        increment_rate_limited(&state.metrics).await;
         return Err(ApiHttpError {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: "rate_limited",
@@ -548,12 +555,17 @@ async fn authz_middleware(
     if let Some(scope) = required_scope_for_request(&state, req.method(), req.uri().path())
         .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?
     {
-        let token = extract_bearer_token(req.headers(), &state.cfg.security.token_header)
-            .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?;
-        state
-            .service
-            .authorize(token, scope)
-            .map_err(|err| ApiHttpError::from_app(err, trace_id.clone()))?;
+        let token = match extract_bearer_token(req.headers(), &state.cfg.security.token_header) {
+            Ok(value) => value,
+            Err(err) => {
+                increment_auth_failure(&state.metrics).await;
+                return Err(ApiHttpError::from_app(err, trace_id.clone()));
+            }
+        };
+        if let Err(err) = state.service.authorize(token, scope) {
+            increment_auth_failure(&state.metrics).await;
+            return Err(ApiHttpError::from_app(err, trace_id.clone()));
+        }
     }
     Ok(next.run(req).await)
 }
@@ -687,6 +699,26 @@ async fn record_request_metrics(
     route.latency_sum_ms += elapsed_ms;
 }
 
+async fn increment_auth_failure(metrics: &Arc<Mutex<ApiMetrics>>) {
+    let mut metrics = metrics.lock().await;
+    metrics.auth_failures_total += 1;
+}
+
+async fn increment_rate_limited(metrics: &Arc<Mutex<ApiMetrics>>) {
+    let mut metrics = metrics.lock().await;
+    metrics.rate_limited_total += 1;
+}
+
+async fn increment_token_created(metrics: &Arc<Mutex<ApiMetrics>>) {
+    let mut metrics = metrics.lock().await;
+    metrics.token_created_total += 1;
+}
+
+async fn increment_token_revoked(metrics: &Arc<Mutex<ApiMetrics>>) {
+    let mut metrics = metrics.lock().await;
+    metrics.token_revoked_total += 1;
+}
+
 async fn render_prometheus_metrics(metrics: &Arc<Mutex<ApiMetrics>>) -> String {
     let metrics = metrics.lock().await;
     let mut lines = vec![
@@ -699,6 +731,18 @@ async fn render_prometheus_metrics(metrics: &Arc<Mutex<ApiMetrics>>) -> String {
         "# HELP mia_http_timeouts_total Total HTTP requests completed with 408.".to_owned(),
         "# TYPE mia_http_timeouts_total counter".to_owned(),
         format!("mia_http_timeouts_total {}", metrics.total_timeouts),
+        "# HELP mia_auth_failures_total Total authorization failures.".to_owned(),
+        "# TYPE mia_auth_failures_total counter".to_owned(),
+        format!("mia_auth_failures_total {}", metrics.auth_failures_total),
+        "# HELP mia_rate_limited_total Total requests rejected by rate limiting.".to_owned(),
+        "# TYPE mia_rate_limited_total counter".to_owned(),
+        format!("mia_rate_limited_total {}", metrics.rate_limited_total),
+        "# HELP mia_token_created_total Total successfully created tokens.".to_owned(),
+        "# TYPE mia_token_created_total counter".to_owned(),
+        format!("mia_token_created_total {}", metrics.token_created_total),
+        "# HELP mia_token_revoked_total Total successfully revoked tokens.".to_owned(),
+        "# TYPE mia_token_revoked_total counter".to_owned(),
+        format!("mia_token_revoked_total {}", metrics.token_revoked_total),
         "# HELP mia_http_requests_by_route_total Requests grouped by method/path/status."
             .to_owned(),
         "# TYPE mia_http_requests_by_route_total counter".to_owned(),
@@ -1079,9 +1123,17 @@ mod tests {
         let metrics = Arc::new(Mutex::new(ApiMetrics::default()));
         record_request_metrics(&metrics, &Method::GET, "/api/v1/health", 200, 4).await;
         record_request_metrics(&metrics, &Method::GET, "/api/v1/health", 503, 7).await;
+        increment_auth_failure(&metrics).await;
+        increment_rate_limited(&metrics).await;
+        increment_token_created(&metrics).await;
+        increment_token_revoked(&metrics).await;
         let text = render_prometheus_metrics(&metrics).await;
         assert!(text.contains("mia_http_requests_total 2"));
         assert!(text.contains("mia_http_errors_total 1"));
+        assert!(text.contains("mia_auth_failures_total 1"));
+        assert!(text.contains("mia_rate_limited_total 1"));
+        assert!(text.contains("mia_token_created_total 1"));
+        assert!(text.contains("mia_token_revoked_total 1"));
         assert!(text.contains("path=\"/api/v1/health\""));
     }
 

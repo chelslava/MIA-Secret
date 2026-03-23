@@ -186,6 +186,8 @@ $env:MIA_SECRET__GENERAL__LOG_LEVEL = "debug"
 Сервер публикует API под префиксом `/api/v1`.
 
 * `GET /api/v1/health` - состояние сервиса.
+* `GET /api/v1/ready` - готовность сервиса (БД + миграции).
+* `GET /api/v1/metrics` - метрики в формате Prometheus.
 * `POST /api/v1/secrets` - создать секрет.
 * `GET /api/v1/secrets` - список секретов.
 * `GET /api/v1/secrets/{id}` - получить секрет по UUID.
@@ -198,3 +200,4 @@ $env:MIA_SECRET__GENERAL__LOG_LEVEL = "debug"
 
 Подробные примеры запросов и ответов см. в `docs/api.md`, а справку по CLI - в `docs/cli.md`.
 Критерии приемки и релизный процесс: `docs/acceptance-checklist.md`, `docs/release.md`.
+Эксплуатационные метрики и диагностика: `docs/observability.md`.
